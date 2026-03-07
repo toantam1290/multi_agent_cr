@@ -38,6 +38,8 @@ class TechnicalSignal(BaseModel):
     ema_cross_bullish: bool    # EMA 9 cắt lên EMA 21
     macd_bullish: bool
     volume_spike: bool         # Volume > 2x average
+    volume_ratio: float = 0.0  # current_volume / avg_volume (cho scalp volume confirmation)
+    volume_trend_up: bool = False  # 3 nến đóng gần nhất volume tăng liên tiếp (early-in-move)
     bb_squeeze: bool           # Bollinger Band squeeze
     support_level: Optional[float] = None
     resistance_level: Optional[float] = None
@@ -45,6 +47,8 @@ class TechnicalSignal(BaseModel):
     score: int = Field(0, ge=0, le=100)  # Legacy bullish score
     net_score: int = Field(0, ge=-100, le=100)  # -100 bearish .. +100 bullish
     direction_bias: str = "NEUTRAL"  # "LONG" | "SHORT" | "NEUTRAL"
+    momentum_bullish: bool = False   # Scalp: RSI 2-candle momentum long
+    momentum_bearish: bool = False    # Scalp: RSI 2-candle momentum short
     # Regime + ATR (Sprint 3)
     atr_value: float = 0.0      # ATR(14) 1h
     atr_pct: float = 0.0       # atr_value / price * 100
@@ -53,6 +57,8 @@ class TechnicalSignal(BaseModel):
     plus_di: float = 0.0
     minus_di: float = 0.0
     bb_width: float = 0.0       # Bollinger bandwidth
+    bb_width_regime: float = 0.0   # Cho classify_regime: scalp = 1h, swing = 1h
+    atr_ratio_regime: float = 0.0  # Cho classify_regime: scalp = 1h, swing = 1h
 
 
 class WhaleSignal(BaseModel):
@@ -177,8 +183,16 @@ _{reasoning_safe}..._
 Size: `${self.position_size_usdt:,.0f} USDT`
 
 Reply /approve {self.id[:8]} hoặc /skip {self.id[:8]}
-⏰ Timeout: 5 phút
+⏰ Timeout: {self._approval_timeout_min()} phút
 """.strip()
+
+    def _approval_timeout_min(self) -> int:
+        """Scalp: 2 phút, swing: 5 phút."""
+        try:
+            from config import get_effective_approval_timeout_sec
+            return max(1, get_effective_approval_timeout_sec() // 60)
+        except Exception:
+            return 5
 
 
 # ─── Trade (sau khi execute) ──────────────────────────────────────────────────

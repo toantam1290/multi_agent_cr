@@ -4,11 +4,12 @@ agents/research_agent.py - Claude Sonnet pre-mortem risk assessment + rule-based
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 from anthropic import AsyncAnthropic
 from loguru import logger
 
-from config import cfg, ALLOWED_PAIRS
+from config import cfg, ALLOWED_PAIRS, get_effective_min_confidence
 from models import (
     TradingSignal, Direction,
     TechnicalSignal, WhaleSignal, SentimentSignal, DerivativesSignal,
@@ -16,6 +17,7 @@ from models import (
 )
 from utils.market_data import (
     BinanceDataFetcher, WhaleDataFetcher, FearGreedFetcher,
+    get_opportunity_pairs,
     classify_regime, calc_entry_sl_tp,
 )
 from database import Database
@@ -23,7 +25,7 @@ from database import Database
 # Estimated cost per Claude call (Sonnet) for budget tracking
 CLAUDE_ESTIMATED_COST_PER_CALL = 0.005
 
-RESEARCH_SYSTEM_PROMPT = """
+RESEARCH_SYSTEM_PROMPT_BASE = """
 Bạn là risk assessor cho trading setup. KHÔNG predict giá. Nhiệm vụ: stress-test thesis.
 
 Bạn nhận setup đã tính sẵn (entry, SL, TP). Trả lời:
@@ -42,9 +44,23 @@ OUTPUT FORMAT (JSON):
   "confidence": 0-100
 }
 
-Nếu verdict = PROCEED: confidence >= 75. Nếu WAIT/AVOID: confidence < 75.
+Nếu verdict = PROCEED: confidence >= 75 (swing) hoặc >= 80 (scalp). Nếu WAIT/AVOID: confidence < 75.
 KHÔNG thêm text ngoài JSON.
 """
+
+
+def _get_system_prompt(style: str) -> str:
+    """Scalp: thêm hướng dẫn horizon ngắn, confidence 80."""
+    base = RESEARCH_SYSTEM_PROMPT_BASE
+    if style == "scalp":
+        return base + """
+
+QUAN TRỌNG khi setup là SCALP:
+- Chỉ xét rủi ro trong 15–60 phút tới, KHÔNG over-penalize vì "market uncertain" dài hạn.
+- Nếu PROCEED: confidence PHẢI >= 80 (scalp cần threshold cao hơn).
+- Fear & Greed index là daily data — ít relevant cho scalp, đừng weight quá nặng.
+"""
+    return base
 
 
 class ResearchAgent:
@@ -66,43 +82,75 @@ class ResearchAgent:
         self,
         technical: TechnicalSignal,
         derivatives: DerivativesSignal,
+        style: str = "swing",
+        pair: str = "",
     ) -> Optional[str]:
         """
         Rule-based Gate. Returns LONG | SHORT | None.
         Claude chỉ được gọi khi filter trả về non-None.
+        Scalp: RSI nới hơn (50/50). Swing: chặt (45/55).
+        Core pairs: exempt volume filter (BTC/ETH thường volume_ratio ~1.0).
+        RELAX_FILTER=true: nới net_score (5/-5), bỏ volume + momentum — để test pipeline.
         """
         funding_pct = derivatives.funding_rate * 100  # 0.0001 → 0.01%
-        # LONG: trend_1d != downtrend, RSI < 45, funding < 0.05%, net_score > 10
+        rsi_long_max = cfg.scan.scalp_rsi_long_max if style == "scalp" else 45
+        rsi_short_min = cfg.scan.scalp_rsi_short_min if style == "scalp" else 55
+        funding_long_max = cfg.scan.funding_long_max_pct
+        funding_short_min = cfg.scan.funding_short_min_pct  # 0.005% default
+        is_core = pair in (cfg.scan.core_pairs or [])
+        relax = getattr(cfg.scan, "relax_filter", False)
+
+        # Scalp: volume confirmation — core pairs exempt. RELAX: bỏ qua
+        if style == "scalp" and not is_core and not relax:
+            vol_ok = technical.volume_spike or technical.volume_ratio >= 1.2 or technical.volume_trend_up
+            if not vol_ok:
+                return None
+
+        # net_score threshold: RELAX dùng 5/-5 thay vì 20/-20 (scalp) hoặc 10/-10 (swing)
+        if relax:
+            net_long_min, net_short_max = 5, -5
+        else:
+            net_long_min = 20 if style == "scalp" else 10
+            net_short_max = -20 if style == "scalp" else -10
+
+        # LONG: trend != downtrend, RSI < threshold, funding < max, net_score > threshold
         if (
             technical.trend_1d != "downtrend"
-            and technical.rsi_1h < 45
-            and funding_pct < 0.05
-            and technical.net_score > 10
+            and technical.rsi_1h < rsi_long_max
+            and funding_pct < funding_long_max
+            and technical.net_score > net_long_min
         ):
+            if style == "scalp" and not relax and not technical.momentum_bullish:
+                return None
             return "LONG"
-        # SHORT: trend_1d != uptrend, RSI > 55, funding > 0.05%, net_score < -10
+        # SHORT: trend != uptrend, RSI > threshold, funding > min, net_score < threshold
         if (
             technical.trend_1d != "uptrend"
-            and technical.rsi_1h > 55
-            and funding_pct > 0.05
-            and technical.net_score < -10
+            and technical.rsi_1h > rsi_short_min
+            and funding_pct > funding_short_min
+            and technical.net_score < net_short_max
         ):
+            if style == "scalp" and not relax and not technical.momentum_bearish:
+                return None
             return "SHORT"
         return None
 
-    async def analyze_pair(self, pair: str) -> Optional[TradingSignal]:
+    async def analyze_pair(self, pair: str) -> tuple[Optional[TradingSignal], dict]:
         """
-        Phân tích một cặp tiền → trả về TradingSignal nếu có cơ hội.
-        Flow: gather → rule-based filter → regime → calc entry/SL/TP → Claude risk assessment.
+        Phân tích một cặp tiền → trả về (TradingSignal | None, metadata).
+        metadata: {rule_passed, claude_proceed} cho observability.
         """
         logger.info(f"Analyzing {pair}...")
+        meta = {"rule_passed": False, "claude_proceed": False}
 
         try:
             # 1. Thu thập data song song (thêm derivatives)
+            style = cfg.scan.trading_style
+            whale_hours = cfg.scan.scalp_whale_hours if style == "scalp" else 4
             current_price, technical, whale_data, sentiment, derivatives = await asyncio.gather(
                 self.binance.get_current_price(pair),
-                self.binance.compute_technical_signal(pair),
-                self.whale.get_whale_transactions(pair),
+                self.binance.compute_technical_signal(pair, style=style),
+                self.whale.get_whale_transactions(pair, hours_back=whale_hours),
                 self.fear_greed.get(),
                 self.binance.get_derivatives_signal(pair),
             )
@@ -113,21 +161,29 @@ class ResearchAgent:
             )
 
             # 2. Rule-based filter — không pass thì skip Claude
-            direction = self._rule_based_filter(technical, derivatives)
+            direction = self._rule_based_filter(technical, derivatives, style=style, pair=pair)
             if direction is None:
                 logger.info(f"{pair}: Rule-based filter → No trade")
                 self.db.log("research_agent", "INFO", f"Filter rejected {pair}", {"pair": pair})
-                return None
+                return None, meta
 
-            # 3. Regime (ADX + BB + ATR)
+            meta["rule_passed"] = True
+
+            # 3. Regime (ADX + BB + ATR) — dùng bb_width_regime, atr_ratio_regime (scalp = 1h nhất quán)
             regime = classify_regime(
                 technical.adx, technical.plus_di, technical.minus_di,
-                technical.bb_width, technical.atr_ratio,
+                technical.bb_width_regime, technical.atr_ratio_regime,
             )
+
+            # Scalp: skip khi regime = volatile (non-trending choppy) — SL tight = nguy hiểm
+            if style == "scalp" and regime == "volatile":
+                logger.info(f"{pair}: Regime volatile (non-trending) → skip scalp")
+                self.db.log("research_agent", "INFO", f"Skip scalp for {pair}: volatile regime", {"pair": pair})
+                return None, meta
 
             if not (technical.atr_value > 0):
                 logger.warning(f"{pair}: ATR invalid ({technical.atr_value}), skipping")
-                return None
+                return None, meta
 
             # 4. Position size check TRƯỚC Claude (tránh lãng phí budget khi available=0)
             available = await self._get_available_balance()
@@ -137,33 +193,39 @@ class ResearchAgent:
             )
             if position_size < 10:
                 logger.info(f"{pair}: Position size too small (${position_size:.2f}), skipping (pre-Claude)")
-                return None
+                return None, meta
 
             # 5. Calc entry/SL/TP (rule-based, ATR)
+            rr_ratio = cfg.trading.scalp_risk_reward_ratio if style == "scalp" else None
             entry, sl, tp = calc_entry_sl_tp(
-                direction, current_price, technical.atr_value, regime
+                direction, current_price, technical.atr_value, regime,
+                style=style, rr_ratio=rr_ratio,
             )
 
             # 6. Claude risk assessment (pre-mortem)
             analysis = await self._claude_analyze(
                 pair, current_price, technical, whale_data, sentiment, derivatives,
-                direction, entry, sl, tp, regime,
+                direction, entry, sl, tp, regime, style=style,
             )
 
             if not analysis or not analysis.get("should_trade"):
                 verdict = analysis.get("verdict", "N/A") if analysis else "budget/error"
                 confidence = analysis.get("confidence", 0) if analysis else 0
+                meta["claude_proceed"] = bool(analysis and analysis.get("should_trade"))
                 logger.info(f"{pair}: Claude → {verdict} (confidence: {confidence})")
                 self.db.log("research_agent", "INFO",
                             f"No opportunity for {pair}",
                             {"confidence": confidence})
-                return None
+                return None, meta
+
+            meta["claude_proceed"] = True
 
             # 7. Build signal
             confidence = int(analysis["confidence"])
-            if confidence < cfg.trading.min_confidence:
-                logger.info(f"{pair}: Confidence {confidence} < {cfg.trading.min_confidence}, skipping")
-                return None
+            min_conf = get_effective_min_confidence()
+            if confidence < min_conf:
+                logger.info(f"{pair}: Confidence {confidence} < {min_conf}, skipping")
+                return None, meta
 
             # Tính R:R
             if direction == "LONG":
@@ -204,13 +266,13 @@ class ResearchAgent:
                 f"@ ${entry:,.2f} | SL: ${sl:,.2f} | TP: ${tp:,.2f} | "
                 f"Confidence: {confidence} | R:R: 1:{rr:.1f}"
             )
-            return signal
+            return signal, meta
 
         except Exception as e:
             err_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             logger.exception(f"Error analyzing {pair}: {err_detail}")
             self.db.log("research_agent", "ERROR", f"Analysis failed for {pair}", {"error": err_detail})
-            return None
+            return None, meta
 
     async def _claude_analyze(
         self,
@@ -225,6 +287,7 @@ class ResearchAgent:
         sl: float,
         tp: float,
         regime: str,
+        style: str = "swing",
     ) -> Optional[dict]:
         """Claude pre-mortem risk assessment. Entry/SL/TP đã tính sẵn (rule-based)."""
 
@@ -245,20 +308,26 @@ class ResearchAgent:
 
             risk_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0
             reward_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0
+            entry_gap_pct = (entry - current_price) / current_price * 100 if current_price > 0 else 0
+
+            rsi_label = "RSI 15m / RSI 5m (timing)" if style == "scalp" else "RSI 1h / RSI 4h"
+            rsi_vals = f"{technical.rsi_1h:.1f} / {technical.rsi_4h:.1f}"
 
             user_prompt = f"""
-Pre-mortem risk assessment cho {pair}:
+Pre-mortem risk assessment cho {pair} ({style.upper()}):
 
 PROPOSED SETUP ({direction}):
 - Entry: ${entry:,.2f}
 - Stop Loss: ${sl:,.2f} (-{risk_pct:.1f}%)
 - Take Profit: ${tp:,.2f} (+{reward_pct:.1f}%)
 - Regime: {regime}
+- Entry gap: {entry_gap_pct:+.2f}% from current (pullback limit — needs retrace to fill)
 
 DATA:
-- Price: ${current_price:,.2f} | Trend 1D: {technical.trend_1d}
-- RSI 1h: {technical.rsi_1h:.1f} | RSI 4h: {technical.rsi_4h:.1f}
+- Price: ${current_price:,.2f} | Trend 4h: {technical.trend_1d}
+- {rsi_label}: {rsi_vals}
 - Tech net_score: {technical.net_score} | Whale: {whale.score}/100
+{f'- momentum_triggered: true (scalp RSI 2-candle — required gate passed)' if style == 'scalp' else ''}
 - Funding: {derivatives.funding_rate*100:.3f}% | Basis: {derivatives.basis_pct:.2f}%
 - F&G: {sentiment.fear_greed_index}/100 | Net flow: ${whale.net_flow/1e6:.1f}M
 
@@ -268,11 +337,12 @@ DATA:
 → Verdict: PROCEED / WAIT / AVOID
 """
 
+            min_conf = get_effective_min_confidence()
             try:
                 response = await self.client.messages.create(
                     model="claude-sonnet-4-6",
-                    max_tokens=500,
-                    system=RESEARCH_SYSTEM_PROMPT,
+                    max_tokens=800,  # 500 có thể truncate JSON
+                    system=_get_system_prompt(style),
                     messages=[{"role": "user", "content": user_prompt}],
                 )
                 self.db.add_anthropic_spend(CLAUDE_ESTIMATED_COST_PER_CALL)  # Track ngay sau API (trước JSON parse)
@@ -297,7 +367,7 @@ DATA:
                 result["entry_price"] = entry
                 result["stop_loss"] = sl
                 result["take_profit"] = tp
-                result["confidence"] = result.get("confidence", 75)
+                result["confidence"] = result.get("confidence", min_conf)
                 result["reasoning"] = result.get("reasoning", "")
                 return result
 
@@ -307,6 +377,55 @@ DATA:
             except Exception as e:
                 logger.error(f"Claude API error: {e}")
                 return None
+
+    def _is_in_scalp_active_hours(self, spec: str) -> bool:
+        """spec = '8-16' → 8h-16h UTC. Để trống = always True."""
+        if not spec or "-" not in spec:
+            return True
+        try:
+            parts = spec.split("-")
+            start_h = int(parts[0].strip())
+            end_h = int(parts[1].strip())
+            now = datetime.now(timezone.utc)
+            h = now.hour
+            if start_h <= end_h:
+                return start_h <= h < end_h
+            return h >= start_h or h < end_h  # e.g. 20-4 = overnight
+        except (ValueError, IndexError):
+            return True
+
+    async def _filter_by_1h_range(
+        self, pairs: list[str], min_range_pct: float
+    ) -> list[str]:
+        """Scalp: chỉ giữ pairs có range 1-2h gần nhất (high-low)/close >= min_range_pct (đang active)."""
+        if not pairs or min_range_pct <= 0:
+            return pairs
+        sem = asyncio.Semaphore(10)  # Rate limit: max 10 klines calls đồng thời
+
+        async def _fetch(p: str):
+            async with sem:
+                return await self.binance.get_klines(p, "1h", 4)  # Chỉ cần 2-4 candles
+
+        tasks = [_fetch(p) for p in pairs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        kept = []
+        for pair, df in zip(pairs, results):
+            if isinstance(df, Exception) or df is None or len(df) < 2:
+                kept.append(pair)  # Lỗi → giữ (fail open)
+                continue
+            # Last 1-2 candles (1-2 giờ gần nhất), không phải 24h
+            high = float(df["high"].iloc[-2:].max())
+            low = float(df["low"].iloc[-2:].min())
+            close = float(df["close"].iloc[-1])
+            if close <= 0:
+                kept.append(pair)
+                continue
+            range_pct = (high - low) / close * 100
+            if range_pct >= min_range_pct:
+                kept.append(pair)
+            else:
+                logger.debug(f"Scalp 1-2h filter: {pair} range {range_pct:.2f}% < {min_range_pct}%")
+        return kept
 
     async def _get_available_balance(self) -> float:
         """Lấy available balance (trừ locked capital trong open positions)"""
@@ -319,30 +438,179 @@ DATA:
         return max(0.0, total - locked)
 
     async def run_full_scan(self) -> list[TradingSignal]:
-        """Scan toàn bộ ALLOWED_PAIRS, return signals có confidence >= min"""
-        logger.info(f"Starting full market scan ({len(ALLOWED_PAIRS)} pairs)...")
-
+        """Scan pairs — fixed mode: ALLOWED_PAIRS; opportunity mode: dynamic screening."""
         if self.db.get_today_spend() >= cfg.anthropic_daily_budget_usd:
             logger.warning("Daily budget exceeded, skipping full scan")
             return []
 
+        sc = cfg.scan
+        pairs_to_scan: list[str]
+        fallback_used = False
+        ticker_volatility_map: dict[str, float] = {}  # For scan_state upsert (opportunity mode)
+
+        if sc.scan_mode == "opportunity":
+            # Scalp time-of-day filter: chỉ scan trong giờ active (ví dụ 8-16 UTC)
+            if sc.trading_style == "scalp" and sc.scalp_active_hours_utc:
+                if not self._is_in_scalp_active_hours(sc.scalp_active_hours_utc):
+                    logger.info(
+                        f"Scalp: outside active hours ({sc.scalp_active_hours_utc} UTC), skipping scan"
+                    )
+                    return []
+            tickers, premium_data = await asyncio.gather(
+                self.binance.get_all_tickers_24hr(),
+                self.binance.get_premium_index_full(),
+            )
+            if not tickers:
+                logger.warning("get_all_tickers_24hr failed or empty, fallback to ALLOWED_PAIRS")
+                fallback_used = True
+                pairs_to_scan = ALLOWED_PAIRS
+            else:
+                futures_symbols = set(p["symbol"] for p in premium_data) if premium_data else set()
+                funding_map = (
+                    {p["symbol"]: float(p.get("lastFundingRate") or 0) for p in premium_data}
+                    if premium_data
+                    else {}
+                )
+                if not premium_data:
+                    logger.warning("get_premium_index_full failed/empty, futures filter disabled")
+
+                # Confluence min: auto từ BTC 24h | manual từ config
+                confluence_min = 2 if sc.market_regime == "sideways" else 1
+                if sc.market_regime_mode == "auto":
+                    btc_ticker = next((t for t in tickers if t.get("symbol") == "BTCUSDT"), None)
+                    if btc_ticker:
+                        btc_pct = abs(float(btc_ticker.get("priceChangePercent") or 0))
+                        confluence_min = 2 if btc_pct < 2.0 else 1
+
+                # Cooldown + hysteresis
+                scan_states = self.db.get_all_scan_states()
+                now_ts = datetime.now(timezone.utc)
+                cutoff = now_ts.timestamp() - sc.cooldown_cycles * sc.cycle_interval_sec
+                def _parse_ts(ts_str: str) -> float:
+                    s = (ts_str or "").replace("Z", "+00:00")
+                    if not s:
+                        return 0.0
+                    try:
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt.timestamp()
+                    except Exception:
+                        return 0.0
+
+                symbols_in_cooldown = {
+                    s for s, st in scan_states.items()
+                    if st.get("last_scanned_at") and _parse_ts(st["last_scanned_at"]) > cutoff
+                }
+
+                pairs_to_scan = get_opportunity_pairs(
+                    tickers,
+                    futures_symbols=futures_symbols or None,
+                    funding_map=funding_map or None,
+                    min_volatility_pct=sc.opportunity_volatility_pct,
+                    max_volatility_pct=sc.opportunity_volatility_max_pct,
+                    min_quote_volume_usd=sc.min_quote_volume_usd,
+                    max_pairs_per_scan=sc.max_pairs_per_scan,
+                    core_pairs=sc.core_pairs,
+                    blacklist=sc.scan_blacklist,
+                    allowed_pairs=ALLOWED_PAIRS if sc.opportunity_use_whitelist else None,
+                    use_whitelist=sc.opportunity_use_whitelist,
+                    confluence_min_score=confluence_min,
+                    funding_extreme_threshold=sc.funding_extreme_threshold,
+                    symbols_in_cooldown=symbols_in_cooldown,
+                    scan_states=scan_states,
+                    hysteresis_entry_pct=sc.hysteresis_entry_pct,
+                    hysteresis_exit_pct=sc.hysteresis_exit_pct,
+                )
+                # Scalp: filter by 1h range — chỉ scan coin đang active (không phải 24h đã move xong)
+                # RELAX_FILTER: bỏ qua filter này để scan nhiều pair hơn
+                if (
+                    sc.trading_style == "scalp"
+                    and pairs_to_scan
+                    and sc.scalp_1h_range_min_pct > 0
+                    and not getattr(sc, "relax_filter", False)
+                ):
+                    pairs_to_scan = await self._filter_by_1h_range(pairs_to_scan, sc.scalp_1h_range_min_pct)
+                ticker_volatility_map = {
+                    t["symbol"]: abs(float(t.get("priceChangePercent") or 0))
+                    for t in tickers if t.get("symbol")
+                }
+                logger.info(
+                    f"Opportunity scan: {len(pairs_to_scan)} pairs "
+                    f"(volatility {sc.opportunity_volatility_pct}–{sc.opportunity_volatility_max_pct}%)"
+                )
+            if not pairs_to_scan and fallback_used and not ALLOWED_PAIRS:
+                logger.error("Ticker fetch failed and ALLOWED_PAIRS empty, skipping cycle")
+                return []
+        else:
+            pairs_to_scan = ALLOWED_PAIRS
+            logger.info(f"Starting full market scan ({len(pairs_to_scan)} pairs, fixed mode)...")
+
+        if not pairs_to_scan:
+            logger.info("No pairs to scan")
+            return []
+
+        # Dry-run: chỉ log, không analyze
+        if sc.scan_dry_run:
+            logger.info(f"DRY-RUN: would scan {pairs_to_scan}")
+            self.db.log(
+                "research_agent",
+                "INFO",
+                "Dry-run: pairs would be scanned",
+                {"pairs": pairs_to_scan, "scan_mode": sc.scan_mode},
+            )
+            return []
+
         # Chạy song song để giảm latency (1 pair lỗi không block các pair khác)
         results = await asyncio.gather(
-            *[self.analyze_pair(pair) for pair in ALLOWED_PAIRS],
+            *[self.analyze_pair(pair) for pair in pairs_to_scan],
             return_exceptions=True,
         )
 
         signals = []
-        for pair, result in zip(ALLOWED_PAIRS, results):
+        rule_based_passed = 0
+        claude_passed = 0
+        opportunity_candidates = len(pairs_to_scan) if sc.scan_mode == "opportunity" else 0
+
+        for pair, result in zip(pairs_to_scan, results):
             if isinstance(result, Exception):
                 logger.error(f"{pair} scan failed: {result}")
                 self.db.log("research_agent", "ERROR", f"Scan failed: {result}", {"pair": pair})
                 continue
-            signal = result
+            signal, meta = result
+            if meta.get("rule_passed"):
+                rule_based_passed += 1
+            if meta.get("claude_proceed"):
+                claude_passed += 1
             if signal:  # analyze_pair đã filter confidence >= min_conf
                 signals.append(signal)
 
-        logger.info(f"Scan complete: {len(signals)}/{len(ALLOWED_PAIRS)} pairs with signals")
+        # Observability: log funnel metrics mỗi cycle
+        funnel = {
+            "scan_mode": sc.scan_mode,
+            "opportunity_candidates": opportunity_candidates,
+            "pairs_scanned": len(pairs_to_scan),
+            "pairs_scanned_list": pairs_to_scan,  # Để UI hiển thị pair nào được scan
+            "rule_based_passed": rule_based_passed,
+            "claude_passed": claude_passed,
+            "signals_generated": len(signals),
+            "fallback_used": fallback_used,
+        }
+        self.db.log("research_agent", "INFO", "Scan cycle funnel", funnel)
+
+        # Update scan_state (cooldown/hysteresis) khi opportunity mode
+        if sc.scan_mode == "opportunity" and ticker_volatility_map:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for pair in pairs_to_scan:
+                vol = ticker_volatility_map.get(pair, 0.0)
+                self.db.upsert_scan_state(
+                    symbol=pair,
+                    last_scanned_at=now_iso,
+                    last_seen_volatility=vol,
+                    in_opportunity=True,
+                )
+
+        logger.info(f"Scan complete: {len(signals)}/{len(pairs_to_scan)} pairs with signals")
         return signals
 
     async def close(self):

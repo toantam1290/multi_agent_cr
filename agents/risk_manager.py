@@ -2,7 +2,7 @@
 agents/risk_manager.py - Kiểm tra risk trước khi forward signal đến user
 """
 from loguru import logger
-from config import cfg
+from config import cfg, get_effective_min_confidence, get_effective_min_risk_reward
 from models import TradingSignal, PortfolioState, SignalStatus
 from database import Database
 
@@ -73,20 +73,22 @@ class RiskManagerAgent:
         return True, ""
 
     def _check_confidence(self, signal: TradingSignal) -> tuple[bool, str]:
-        """Confidence phải đủ cao"""
-        if signal.confidence < self.cfg.min_confidence:
+        """Confidence phải đủ cao (scalp: 80, swing: 75)"""
+        min_conf = get_effective_min_confidence()
+        if signal.confidence < min_conf:
             return False, (
                 f"{RiskRejectionReason.LOW_CONFIDENCE}: "
-                f"{signal.confidence} < {self.cfg.min_confidence}"
+                f"{signal.confidence} < {min_conf}"
             )
         return True, ""
 
     def _check_risk_reward(self, signal: TradingSignal) -> tuple[bool, str]:
-        """R:R tối thiểu 1:2"""
-        if signal.risk_reward < self.cfg.min_risk_reward:
+        """R:R tối thiểu (scalp: 1.5, swing: 2.0)"""
+        min_rr = get_effective_min_risk_reward()
+        if signal.risk_reward < min_rr:
             return False, (
                 f"{RiskRejectionReason.LOW_RISK_REWARD}: "
-                f"1:{signal.risk_reward:.1f} < 1:{self.cfg.min_risk_reward}"
+                f"1:{signal.risk_reward:.1f} < 1:{min_rr}"
             )
         return True, ""
 

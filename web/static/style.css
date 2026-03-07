@@ -89,6 +89,58 @@ body {
   color: var(--text-muted);
 }
 
+/* Monitor guide */
+.monitor-guide {
+  margin-bottom: 1.5rem;
+}
+
+.monitor-guide details {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+}
+
+.monitor-guide summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.monitor-guide summary:hover {
+  color: var(--text);
+}
+
+.guide-content {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.guide-content p {
+  margin-bottom: 0.5rem;
+}
+
+.guide-content p:last-child {
+  margin-bottom: 0;
+}
+
+.funnel-pairs {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.5rem;
+}
+
+.funnel-pairs code {
+  font-family: var(--font-mono);
+  background: var(--bg-elevated);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+}
+
 /* Stats grid */
 .stats-grid {
   display: grid;
@@ -148,6 +200,110 @@ body {
 
 .panel-logs {
   grid-column: 1 / -1;
+}
+
+.panel-opportunity,
+.panel-dashboard {
+  grid-column: 1 / -1;
+}
+
+/* Opportunity Screening */
+.opportunity-config {
+  padding: 1rem 1.25rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.opp-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.opp-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.opp-value {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+.opportunity-funnel {
+  padding: 0 1.25rem 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.opportunity-funnel h3 {
+  font-size: 0.85rem;
+  padding: 0.75rem 0 0.5rem;
+  color: var(--text-muted);
+}
+
+.funnel-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 0.5rem 0;
+}
+
+.funnel-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 80px;
+}
+
+.funnel-val {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.funnel-lbl {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.funnel-warn {
+  font-size: 0.8rem;
+  color: var(--warn);
+  margin-top: 0.5rem;
+}
+
+/* Dashboard badges */
+.score-badge {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+}
+
+.action-badge {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.action-badge.action-scale {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--accent);
+}
+
+.action-badge.action-defensive {
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--danger);
+}
+
+.action-badge.action-tighten {
+  background: rgba(210, 153, 34, 0.2);
+  color: var(--warn);
 }
 
 .table-wrap {

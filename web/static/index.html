@@ -23,30 +23,72 @@
     </header>
 
     <main class="main">
+      <section class="monitor-guide" id="monitor-guide">
+        <details>
+          <summary>📋 Hướng dẫn theo dõi — Cần xem gì?</summary>
+          <div class="guide-content">
+            <p><strong>Funnel:</strong> Candidates → Scanned → Rule passed → Claude passed → Signals. Nếu Rule passed = 0: pair không đạt net_score (scalp cần ±20), volume, RSI momentum, hoặc funding.</p>
+            <p><strong>1h range filter:</strong> Scalp chỉ scan pair có 1–2h range ≥ 0.5% (coin đang active). BTC/ETH thường bị lọc khi thị trường flat.</p>
+            <p><strong>Volatility 5–25%:</strong> Pair phải có |24h change| trong khoảng này để vào opportunity list.</p>
+            <p><strong>Pending Signals:</strong> Chờ approve qua Telegram. Scalp timeout 2 phút, swing 5 phút.</p>
+          </div>
+        </details>
+      </section>
+
       <section class="stats-grid">
-        <div class="stat-card">
+        <div class="stat-card" title="Tổng lãi/lỗ từ tất cả trades đã đóng">
           <span class="stat-label">Total PnL</span>
           <span class="stat-value" id="total-pnl">—</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" title="PnL hôm nay (trades đóng trong 24h)">
           <span class="stat-label">Daily PnL</span>
           <span class="stat-value" id="daily-pnl">—</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" title="% trades thắng / tổng trades đóng">
           <span class="stat-label">Win Rate</span>
           <span class="stat-value" id="win-rate">—</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" title="Số position đang mở, chờ SL/TP">
           <span class="stat-label">Open Positions</span>
           <span class="stat-value" id="open-positions">—</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" title="Signals chờ approve qua Telegram (scalp: 2 phút)">
           <span class="stat-label">Pending Signals</span>
           <span class="stat-value" id="pending-signals">—</span>
         </div>
       </section>
 
       <div class="panels">
+        <section class="panel panel-opportunity">
+          <h2>Opportunity Screening</h2>
+          <div id="opportunity-body">
+            <div class="empty">Loading...</div>
+          </div>
+        </section>
+
+        <section class="panel panel-dashboard">
+          <h2>Daily Dashboard (Quality Score)</h2>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Signals</th>
+                  <th>Approved</th>
+                  <th>Exec</th>
+                  <th>Win%</th>
+                  <th>Net PnL</th>
+                  <th>Score</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="dashboard-body">
+                <tr><td colspan="8" class="empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="panel">
           <h2>Open Positions</h2>
           <div class="table-wrap">

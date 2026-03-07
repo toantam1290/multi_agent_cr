@@ -2,6 +2,7 @@
 utils/market_data.py - Fetch market data từ Binance và whale data (free sources)
 """
 import asyncio
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 import httpx
@@ -13,7 +14,8 @@ from config import cfg, WHALE_MIN_USD
 from models import TechnicalSignal, WhaleSignal, SentimentSignal, DerivativesSignal
 
 # Retry cho timeout/connection (transient errors)
-HTTP_TIMEOUT = 15.0
+# HTTP_TIMEOUT_SEC: tăng lên 30 nếu mạng chậm / Binance bị throttle (ConnectTimeout)
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SEC", "30"))
 RETRY_MAX = 3
 RETRY_DELAYS = (1, 2, 3)
 _RETRY_EXC = (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
@@ -103,6 +105,38 @@ class BinanceDataFetcher:
             "low": float(d["lowPrice"]),
             "quote_volume": float(d["quoteVolume"]),
         }
+
+    async def get_all_tickers_24hr(self) -> list[dict]:
+        """Lấy tất cả ticker 24h (spot). Không truyền symbol = all pairs."""
+        try:
+            resp = await _http_get_with_retry(
+                self._client,
+                f"{self.base}/ticker/24hr",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning(f"get_all_tickers_24hr failed: {e}")
+            return []
+
+    async def get_premium_index_full(self) -> list[dict]:
+        """
+        Lấy full premiumIndex (futures) — 1 request, trả toàn bộ symbols.
+        Từ đó derive: futures_symbols = set(s['symbol']), funding_map = {s: lastFundingRate}.
+        Nếu fail -> return [].
+        """
+        try:
+            resp = await _http_get_with_retry(
+                self._client,
+                f"{self._futures_base}/premiumIndex",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning(f"get_premium_index_full failed: {e}")
+            return []
 
     # ─── Binance Futures (funding, OI, basis) ───────────────────────────────
 
@@ -224,35 +258,71 @@ class BinanceDataFetcher:
             # funding_rate=0.0005 (0.05%) → không pass LONG (<0.05) cũng không pass SHORT (>0.05)
             return DerivativesSignal(funding_rate=0.0005)
 
-    async def compute_technical_signal(self, symbol: str) -> TechnicalSignal:
-        """Tính toán tất cả technical indicators"""
-        logger.info(f"Computing technical signals for {symbol}")
+    async def compute_technical_signal(self, symbol: str, style: str = "swing") -> TechnicalSignal:
+        """
+        Tính toán technical indicators.
+        style: swing -> 1h/4h/1d (majors, hold longer)
+        style: scalp -> 15m direction, 5m timing+ATR, 1h ADX, 4h trend (Option A)
+        """
+        if style not in ("swing", "scalp"):
+            style = "swing"
 
-        # Fetch data ở nhiều timeframes
-        df_1h, df_4h, df_1d = await asyncio.gather(
-            self.get_klines(symbol, "1h", 100),
-            self.get_klines(symbol, "4h", 100),
-            self.get_klines(symbol, "1d", 210),  # Cần ≥200 cho EMA200
-        )
+        logger.info(f"Computing technical signals for {symbol} ({style})")
 
-        # RSI
-        rsi_1h = float(ta.rsi(df_1h["close"], length=14).iloc[-1])
-        rsi_4h = float(ta.rsi(df_4h["close"], length=14).iloc[-1])
+        if style == "swing":
+            df_fast, df_slow, df_trend = await asyncio.gather(
+                self.get_klines(symbol, "1h", 100),
+                self.get_klines(symbol, "4h", 100),
+                self.get_klines(symbol, "1d", 210),
+            )
+            df_atr = df_fast  # swing: ATR từ 1h
+            df_adx = df_slow # swing: ADX từ 4h
+            min_rows = 50
+        else:
+            # scalp Option A: 15m direction, 5m timing+ATR, 1h ADX, 4h trend
+            df_5m, df_15m, df_1h, df_4h = await asyncio.gather(
+                self.get_klines(symbol, "5m", 100),
+                self.get_klines(symbol, "15m", 100),
+                self.get_klines(symbol, "1h", 100),
+                self.get_klines(symbol, "4h", 100),
+            )
+            df_fast = df_15m  # direction + setup: RSI, EMA, MACD, volume, BB
+            df_atr = df_5m    # ATR SL/TP + RSI 5m pullback timing
+            df_slow = df_5m   # rsi_4h = RSI 5m (pullback)
+            df_trend = df_4h
+            df_adx = df_1h
+            min_rows = 50
 
-        # EMA crossover (EMA9 vs EMA21)
-        ema9 = ta.ema(df_1h["close"], length=9)
-        ema21 = ta.ema(df_1h["close"], length=21)
-        ema_cross_bullish = (
-            float(ema9.iloc[-1]) > float(ema21.iloc[-1]) and
-            float(ema9.iloc[-2]) <= float(ema21.iloc[-2])
-        )
-        ema_cross_bearish = (
-            float(ema9.iloc[-1]) < float(ema21.iloc[-1]) and
-            float(ema9.iloc[-2]) >= float(ema21.iloc[-2])
-        )
+        if len(df_fast) < min_rows or len(df_slow) < min_rows or len(df_trend) < 50:
+            raise ValueError(f"Insufficient data for {symbol}")
+        if style == "scalp" and (len(df_atr) < min_rows or len(df_adx) < min_rows):
+            raise ValueError(f"Insufficient data for {symbol}")
+
+        def _safe_rsi(df: pd.DataFrame, length: int = 14, default: float = 50.0) -> float:
+            s = ta.rsi(df["close"], length=length)
+            if s is None or s.empty or pd.isna(s.iloc[-1]):
+                return default
+            return float(s.iloc[-1])
+
+        # RSI: rsi_1h = fast TF, rsi_4h = slow TF
+        rsi_1h = _safe_rsi(df_fast, 14)
+        rsi_4h = _safe_rsi(df_slow, 14)
+
+        # EMA crossover (EMA9 vs EMA21) trên fast TF — cần price confirm (close > EMA21)
+        ema9 = ta.ema(df_fast["close"], length=9)
+        ema21 = ta.ema(df_fast["close"], length=21)
+        ema_cross_bullish = False
+        ema_cross_bearish = False
+        if ema9 is not None and ema21 is not None and len(ema9) >= 2 and len(ema21) >= 2:
+            e9, e21 = float(ema9.iloc[-1]), float(ema21.iloc[-1])
+            close = float(df_fast["close"].iloc[-1])
+            cross_bull = e9 > e21 and float(ema9.iloc[-2]) <= float(ema21.iloc[-2])
+            cross_bear = e9 < e21 and float(ema9.iloc[-2]) >= float(ema21.iloc[-2])
+            ema_cross_bullish = cross_bull and close > e21  # Price confirm
+            ema_cross_bearish = cross_bear and close < e21
 
         # MACD
-        macd_df = ta.macd(df_1h["close"])
+        macd_df = ta.macd(df_fast["close"])
         macd_bullish = False
         macd_bearish = False
         if macd_df is not None and not macd_df.empty:
@@ -261,13 +331,20 @@ class BinanceDataFetcher:
             macd_bullish = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
             macd_bearish = float(macd_line.iloc[-1]) < float(signal_line.iloc[-1])
 
-        # Volume spike (volume > 2x average của 20 nến trước)
-        avg_volume = df_1h["volume"].iloc[-21:-1].mean()
-        current_volume = float(df_1h["volume"].iloc[-1])
-        volume_spike = current_volume > avg_volume * 2
+        # Volume spike: dùng nến đã đóng (iloc[-2]). avg = 20 nến TRƯỚC iloc[-2] (không bao gồm prev)
+        vol_slice = df_fast["volume"].iloc[-22:-2]
+        avg_volume = vol_slice.mean() if len(vol_slice) > 0 else 0.0
+        prev_volume = float(df_fast["volume"].iloc[-2]) if len(df_fast) >= 2 else 0.0
+        volume_spike = avg_volume > 0 and prev_volume > avg_volume * 2
+        volume_ratio = prev_volume / avg_volume if avg_volume > 0 else 0.0
+        # Volume trend: 3 nến đóng tăng liên tiếp + v2 > 50% avg (tránh micro-volume pass)
+        volume_trend_up = False
+        if len(df_fast) >= 4 and avg_volume > 0:
+            v4, v3, v2 = float(df_fast["volume"].iloc[-4]), float(df_fast["volume"].iloc[-3]), float(df_fast["volume"].iloc[-2])
+            volume_trend_up = (v4 < v3 < v2) and (v2 > avg_volume * 0.5)
 
         # Bollinger Bands squeeze + width (regime)
-        bb = ta.bbands(df_1h["close"], length=20)
+        bb = ta.bbands(df_fast["close"], length=20)
         bb_squeeze = False
         bb_width = 0.0
         if bb is not None and not bb.empty:
@@ -276,18 +353,24 @@ class BinanceDataFetcher:
             bb_width = float(bandwidth)
 
         # Support/Resistance (simplified: recent swing high/low)
-        recent_high = float(df_1d["high"].iloc[-20:].max())
-        recent_low = float(df_1d["low"].iloc[-20:].min())
+        recent_high = float(df_trend["high"].iloc[-20:].max())
+        recent_low = float(df_trend["low"].iloc[-20:].min())
 
-        # Trend xác định bằng EMA 50 so với EMA 200 trên 1D
-        ema50_1d = ta.ema(df_1d["close"], length=50)
-        ema200_1d = ta.ema(df_1d["close"], length=200)
-        if ema50_1d is not None and ema200_1d is not None:
-            e50 = float(ema50_1d.iloc[-1])
-            e200 = float(ema200_1d.iloc[-1])
-            if e50 > e200 * 1.01:
+        # Trend: swing = EMA50 vs EMA200 trên 1D; scalp = EMA20 vs EMA50 trên 4h
+        if style == "swing":
+            ema_short = ta.ema(df_trend["close"], length=50)
+            ema_long = ta.ema(df_trend["close"], length=200)
+        else:
+            ema_short = ta.ema(df_trend["close"], length=20)
+            ema_long = ta.ema(df_trend["close"], length=50)
+        if ema_short is not None and ema_long is not None:
+            e_short = float(ema_short.iloc[-1])
+            e_long = float(ema_long.iloc[-1])
+            if pd.isna(e_short) or pd.isna(e_long) or e_long <= 0:
+                trend_1d = "sideways"
+            elif e_short > e_long * 1.01:
                 trend_1d = "uptrend"
-            elif e50 < e200 * 0.99:
+            elif e_short < e_long * 0.99:
                 trend_1d = "downtrend"
             else:
                 trend_1d = "sideways"
@@ -297,24 +380,65 @@ class BinanceDataFetcher:
         # Bullish vs Bearish score (net_score -100 to +100)
         bullish = 0
         bearish = 0
-        if 30 <= rsi_1h <= 70:
-            bullish += 8
-            bearish += 8
+        # RSI 40-50 / 50-60: chỉ cộng khi trend aligned (pullback trong uptrend / bounce trong downtrend)
+        if 40 <= rsi_1h <= 50 and trend_1d == "uptrend":
+            bullish += 5
+        elif 50 < rsi_1h <= 60 and trend_1d == "downtrend":
+            bearish += 5
         if rsi_1h < 40:
             bullish += 20  # Oversold = long
         if rsi_1h > 70:
             bearish += 20  # Overbought = short
-        if ema_cross_bullish:
-            bullish += 25
-        if ema_cross_bearish:
-            bearish += 25
-        if macd_bullish:
-            bullish += 20
-        if macd_bearish:
-            bearish += 20
-        if volume_spike:
-            bullish += 5
-            bearish += 5
+        momentum_bullish = False
+        momentum_bearish = False
+        if style == "scalp":
+            # 5m pullback timing: CHỈ cộng khi aligned với trend 4h
+            if rsi_4h < 40 and trend_1d == "uptrend":
+                bullish += 10
+            if rsi_4h > 70 and trend_1d == "downtrend":
+                bearish += 10
+            # Scalp: BỎ EMA cross + MACD (lagging), thêm RSI momentum + candle body
+            # RSI momentum: 2 nến liên tiếp tăng + delta > 2.0 (loại noise)
+            rsi_series = ta.rsi(df_fast["close"], length=14)
+            if rsi_series is not None and len(rsi_series) >= 3:
+                r0, r1, r2 = float(rsi_series.iloc[-1]), float(rsi_series.iloc[-2]), float(rsi_series.iloc[-3])
+                if rsi_1h < 45 and r0 > r1 and r1 > r2 and (r0 - r2) > 2.0:
+                    bullish += 15
+                    momentum_bullish = True
+                if rsi_1h > 55 and r0 < r1 and r1 < r2 and (r2 - r0) > 2.0:
+                    bearish += 15
+                    momentum_bearish = True
+            # Candle body: dùng nến đã đóng (iloc[-2]) — nến chưa đóng không đáng tin
+            if len(df_fast) >= 2:
+                last_o, last_h, last_l, last_c = (
+                    float(df_fast["open"].iloc[-2]), float(df_fast["high"].iloc[-2]),
+                    float(df_fast["low"].iloc[-2]), float(df_fast["close"].iloc[-2]),
+                )
+                candle_range = last_h - last_l if last_h > last_l else 0.0001
+                body_pct = abs(last_c - last_o) / candle_range * 100
+                if body_pct > 50:  # Body > 50% range = strong candle
+                    if last_c > last_o:
+                        bullish += 10
+                    else:
+                        bearish += 10
+        else:
+            # Swing: giữ EMA cross + MACD (weight thấp hơn)
+            if ema_cross_bullish:
+                bullish += 15
+            if ema_cross_bearish:
+                bearish += 15
+            if macd_bullish:
+                bullish += 20
+            if macd_bearish:
+                bearish += 20
+        if volume_spike and len(df_fast) >= 2:
+            # Volume direction từ nến đã đóng (iloc[-2]) — nhất quán với candle body
+            prev_close = float(df_fast["close"].iloc[-2])
+            prev_open = float(df_fast["open"].iloc[-2])
+            if prev_close > prev_open:
+                bullish += 10
+            else:
+                bearish += 10
         if trend_1d == "uptrend":
             bullish += 10
         if trend_1d == "downtrend":
@@ -324,17 +448,17 @@ class BinanceDataFetcher:
         direction_bias = "LONG" if net_score > 10 else ("SHORT" if net_score < -10 else "NEUTRAL")
         score = max(0, min(100, net_score + 50))  # Legacy: map -100..100 to 0..100
 
-        # ATR (1h), ADX (4h), ATR ratio
-        atr14 = ta.atr(df_1h["high"], df_1h["low"], df_1h["close"], length=14)
-        atr50 = ta.atr(df_1h["high"], df_1h["low"], df_1h["close"], length=50)
+        # ATR: swing=1h, scalp=5m (tight SL/TP)
+        atr14 = ta.atr(df_atr["high"], df_atr["low"], df_atr["close"], length=14)
+        atr50 = ta.atr(df_atr["high"], df_atr["low"], df_atr["close"], length=50)
         atr_value = float(atr14.iloc[-1]) if atr14 is not None and not atr14.empty else 0.0
         atr50_val = float(atr50.iloc[-1]) if atr50 is not None and not atr50.empty else atr_value
         atr_ratio = atr_value / atr50_val if atr50_val > 0 else 0.0
-        current_price_1h = float(df_1h["close"].iloc[-1])
+        current_price_1h = float(df_fast["close"].iloc[-1])
         atr_pct = atr_value / current_price_1h * 100 if current_price_1h > 0 else 0.0
 
-        # ADX trên 4h (ổn định hơn 1h). pandas-ta: ADX_14, DMP_14, DMN_14
-        adx_df = ta.adx(df_4h["high"], df_4h["low"], df_4h["close"], length=14)
+        # ADX: swing=4h, scalp=1h. pandas-ta: ADX_14, DMP_14, DMN_14
+        adx_df = ta.adx(df_adx["high"], df_adx["low"], df_adx["close"], length=14)
         adx_val = 0.0
         plus_di_val = 0.0
         minus_di_val = 0.0
@@ -350,12 +474,30 @@ class BinanceDataFetcher:
             if dmn_col is not None:
                 minus_di_val = float(adx_df[dmn_col].iloc[-1])
 
+        # Regime: scalp dùng BB + ATR từ 1h (df_adx) — nhất quán với ADX. Swing giữ nguyên.
+        bb_width_regime = bb_width
+        atr_ratio_regime = atr_ratio
+        if style == "scalp":
+            bb_1h = ta.bbands(df_adx["close"], length=20)
+            if bb_1h is not None and not bb_1h.empty:
+                bbm = float(bb_1h.iloc[-1, 1])
+                if bbm > 0:
+                    bb_width_regime = float((bb_1h.iloc[-1, 2] - bb_1h.iloc[-1, 0]) / bbm)
+            atr14_1h = ta.atr(df_adx["high"], df_adx["low"], df_adx["close"], length=14)
+            atr50_1h = ta.atr(df_adx["high"], df_adx["low"], df_adx["close"], length=50)
+            if atr14_1h is not None and not atr14_1h.empty and atr50_1h is not None and not atr50_1h.empty:
+                a50 = float(atr50_1h.iloc[-1])
+                if a50 > 0:
+                    atr_ratio_regime = float(atr14_1h.iloc[-1]) / a50
+
         return TechnicalSignal(
             rsi_1h=rsi_1h,
             rsi_4h=rsi_4h,
             ema_cross_bullish=ema_cross_bullish,
             macd_bullish=macd_bullish,
             volume_spike=volume_spike,
+            volume_ratio=volume_ratio,
+            volume_trend_up=volume_trend_up,
             bb_squeeze=bb_squeeze,
             support_level=recent_low,
             resistance_level=recent_high,
@@ -363,6 +505,8 @@ class BinanceDataFetcher:
             score=score,
             net_score=net_score,
             direction_bias=direction_bias,
+            momentum_bullish=momentum_bullish,
+            momentum_bearish=momentum_bearish,
             atr_value=atr_value,
             atr_pct=atr_pct,
             atr_ratio=atr_ratio,
@@ -370,10 +514,130 @@ class BinanceDataFetcher:
             plus_di=plus_di_val,
             minus_di=minus_di_val,
             bb_width=bb_width,
+            bb_width_regime=bb_width_regime,
+            atr_ratio_regime=atr_ratio_regime,
         )
 
     async def close(self):
         await self._client.aclose()
+
+
+def get_opportunity_pairs(
+    tickers: list[dict],
+    futures_symbols: set[str] | None = None,
+    funding_map: dict[str, float] | None = None,
+    min_volatility_pct: float = 5.0,
+    max_volatility_pct: float = 25.0,
+    min_quote_volume_usd: float = 5_000_000,
+    max_pairs_per_scan: int = 30,
+    core_pairs: list[str] | None = None,
+    blacklist: list[str] | None = None,
+    allowed_pairs: list[str] | None = None,
+    use_whitelist: bool = False,
+    confluence_min_score: int = 1,
+    funding_extreme_threshold: float = 0.001,
+    symbols_in_cooldown: set[str] | None = None,
+    scan_states: dict[str, dict] | None = None,
+    hysteresis_entry_pct: float = 5.0,
+    hysteresis_exit_pct: float = 3.0,
+) -> list[str]:
+    """
+    Lọc cặp có tín hiệu bất thường (opportunity).
+    Confluence: +1 volatility, +1 volume spike, +1 funding extreme.
+    Hysteresis: vào khi |change| >= entry, ra khi |change| < exit.
+    """
+    core_pairs = core_pairs or []
+    blacklist = blacklist or []
+    blacklist_set = set(blacklist)
+    symbols_in_cooldown = symbols_in_cooldown or set()
+    scan_states = scan_states or {}
+
+    def _safe_float(val, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
+    # Median quoteVolume cho volume spike
+    usdt_volumes = [
+        _safe_float(t.get("quoteVolume"))
+        for t in tickers
+        if (t.get("symbol") or "").endswith("USDT") and _safe_float(t.get("quoteVolume")) > 0
+    ]
+    median_volume = float(sorted(usdt_volumes)[len(usdt_volumes) // 2]) if usdt_volumes else 0
+
+    # 1. Filter cơ bản + confluence + hysteresis
+    candidates = []
+    for t in tickers:
+        symbol = t.get("symbol") or ""
+        if not symbol.endswith("USDT"):
+            continue
+        if symbol in blacklist_set:
+            continue
+        if symbol in symbols_in_cooldown:
+            continue
+        qv = _safe_float(t.get("quoteVolume"))
+        if qv < min_quote_volume_usd:
+            continue
+        pct = _safe_float(t.get("priceChangePercent"))
+        abs_pct = abs(pct)
+
+        # Hysteresis: entry vs exit threshold
+        state = scan_states.get(symbol, {})
+        in_opp = bool(state.get("in_opportunity", 0))
+        if in_opp:
+            if abs_pct < hysteresis_exit_pct:
+                continue  # Exit list
+        else:
+            if abs_pct < hysteresis_entry_pct:
+                continue  # Chưa đủ để vào
+
+        if not (min_volatility_pct <= abs_pct <= max_volatility_pct):
+            continue
+
+        # Confluence score
+        score = 0
+        if min_volatility_pct <= abs_pct <= max_volatility_pct:
+            score += 1
+        if median_volume > 0 and qv >= 2 * median_volume:
+            score += 1
+        if funding_map and abs(funding_map.get(symbol, 0)) >= funding_extreme_threshold:
+            score += 1
+        if score < confluence_min_score:
+            continue
+
+        candidates.append({"symbol": symbol, "priceChangePercent": pct, "quoteVolume": qv})
+
+    # 2. Futures filter
+    if futures_symbols:
+        candidates = [c for c in candidates if c["symbol"] in futures_symbols]
+
+    # 3. Whitelist mode
+    if use_whitelist and allowed_pairs:
+        allowed_set = set(allowed_pairs)
+        candidates = [c for c in candidates if c["symbol"] in allowed_set]
+
+    # 4. Sort theo abs(priceChangePercent) giảm dần
+    candidates.sort(key=lambda x: abs(x["priceChangePercent"]), reverse=True)
+
+    # 5. Cap
+    capped = [c["symbol"] for c in candidates[:max_pairs_per_scan]]
+
+    # 6. Add core_pairs ở đầu, dedupe, core không tính vào cap
+    result = []
+    seen = set()
+    for p in core_pairs:
+        if p and p not in seen:
+            result.append(p)
+            seen.add(p)
+    for p in capped:
+        if p not in seen:
+            result.append(p)
+            seen.add(p)
+
+    return result
 
 
 def classify_regime(
@@ -385,10 +649,13 @@ def classify_regime(
 ) -> str:
     """
     Regime từ ADX + BB Width + ATR ratio.
-    Returns: trending_up | trending_down | ranging | volatile
+    Returns: trending_up | trending_down | ranging | volatile | trending_volatile
+    trending_volatile = best scalp: strong trend + high volatility → wider SL (1.2)
     """
+    if atr_ratio > 1.5 and adx > 25:
+        return "trending_volatile"  # Strong trend + momentum
     if atr_ratio > 1.5:
-        return "volatile"
+        return "volatile"  # Choppy, dangerous
     if adx > 25:
         return "trending_up" if plus_di > minus_di else "trending_down"
     if adx < 20 and bb_width < 0.03:
@@ -401,19 +668,39 @@ def calc_entry_sl_tp(
     current_price: float,
     atr_value: float,
     regime: str,
+    style: str = "swing",
+    rr_ratio: float | None = None,
 ) -> tuple[float, float, float]:
     """
-    Rule-based entry/SL/TP. ATR multiplier: 1.5 (trending) / 1.2 (ranging).
+    Rule-based entry/SL/TP.
+    swing: ATR mult 1.5 (trending) / 1.2 (ranging), R:R 1:2
+    scalp: ATR mult 1.0 (trending) / 0.8 (ranging), R:R 1:1.5 (config), pullback entry
     Returns (entry, sl, tp).
     """
-    mult = 1.5 if regime in ("trending_up", "trending_down") else 1.2
-    entry = current_price
+    if style == "scalp":
+        # trending_volatile: mult 1.2 (wider SL to survive momentum)
+        if regime == "trending_volatile":
+            mult = 1.2
+        elif regime in ("trending_up", "trending_down"):
+            mult = 1.0
+        else:
+            mult = 0.8
+        rr = rr_ratio if rr_ratio and rr_ratio > 0 else 1.5  # scalp default 1:1.5
+        # Pullback entry: limit level chờ giá về (LONG -0.2*ATR, SHORT +0.2*ATR)
+        if direction == "LONG":
+            entry = current_price - 0.2 * atr_value
+        else:
+            entry = current_price + 0.2 * atr_value
+    else:
+        mult = 1.5 if regime in ("trending_up", "trending_down") else 1.2
+        rr = rr_ratio if rr_ratio and rr_ratio > 0 else 2.0
+        entry = current_price
     if direction == "LONG":
         sl = entry - mult * atr_value
-        tp = entry + 2.0 * (entry - sl)
+        tp = entry + rr * (entry - sl)
     else:
         sl = entry + mult * atr_value
-        tp = entry - 2.0 * (sl - entry)
+        tp = entry - rr * (sl - entry)
     return entry, sl, tp
 
 
@@ -426,7 +713,7 @@ class WhaleDataFetcher:
     """
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=12.0)
+        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
     async def get_whale_transactions(
         self,
@@ -437,7 +724,7 @@ class WhaleDataFetcher:
         coin = symbol.lower().replace("usdt", "")
 
         tasks = [
-            self._fetch_binance_large_trades(symbol, min_usd),
+            self._fetch_binance_large_trades(symbol, min_usd, hours_back),
             self._fetch_binance_orderbook_walls(symbol),
         ]
         if coin == "btc":
@@ -456,12 +743,14 @@ class WhaleDataFetcher:
         return self._build_signal(all_data, symbol)
 
     async def _fetch_binance_large_trades(
-        self, symbol: str, min_usd: float
+        self, symbol: str, min_usd: float, hours_back: int = 4
     ) -> list[dict]:
         """
         Public endpoint, không cần key.
         isBuyerMaker=True  → seller chủ động → sell pressure
         isBuyerMaker=False → buyer chủ động → buy pressure
+        limit=1000 = 1000 trades mới nhất (scalp-relevant). Không dùng startTime —
+        Binance với startTime trả về trades cũ nhất trong window, không phải mới nhất.
         """
         try:
             price_resp, trades_resp = await asyncio.gather(

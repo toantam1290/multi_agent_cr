@@ -81,6 +81,14 @@ class Database:
                 data TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS scan_state (
+                symbol TEXT PRIMARY KEY,
+                last_scanned_at TEXT,
+                last_seen_volatility REAL,
+                in_opportunity INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair);
             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -96,6 +104,7 @@ class Database:
             "ALTER TABLE signals ADD COLUMN net_score INTEGER",
             "ALTER TABLE signals ADD COLUMN model_version TEXT",
             "ALTER TABLE trades ADD COLUMN fees_usdt REAL",
+            "ALTER TABLE signals ADD COLUMN cancel_reason TEXT",
         ]
         with self._write_lock:
             for sql in migrations:
@@ -113,7 +122,7 @@ class Database:
             from datetime import timedelta
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_sec)).isoformat()
             cur = self.conn.execute(
-                "UPDATE signals SET status = 'SKIPPED' WHERE status = 'PENDING' AND created_at < ?",
+                "UPDATE signals SET status = 'SKIPPED', cancel_reason = 'timeout' WHERE status = 'PENDING' AND created_at < ?",
                 (cutoff,),
             )
             self.conn.commit()
@@ -197,12 +206,16 @@ class Database:
             self.conn.commit()
             self._inc_daily_stat("total_signals")
 
-    def update_signal_status(self, signal_id: str, status: SignalStatus):
+    def update_signal_status(
+        self, signal_id: str, status: SignalStatus, cancel_reason: str | None = None
+    ):
         extra = {}
         if status == SignalStatus.APPROVED:
             extra["approved_at"] = datetime.now(timezone.utc).isoformat()
         elif status == SignalStatus.EXECUTED:
             extra["executed_at"] = datetime.now(timezone.utc).isoformat()
+        if cancel_reason is not None:
+            extra["cancel_reason"] = cancel_reason
 
         set_clause = "status = ?"
         params = [status.value]
@@ -366,6 +379,45 @@ class Database:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ─── Scan state (cooldown/hysteresis) ───────────────────────────────────
+
+    def get_scan_state(self, symbol: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT symbol, last_scanned_at, last_seen_volatility, in_opportunity, updated_at FROM scan_state WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_scan_states(self) -> dict[str, dict]:
+        """Return {symbol: {last_scanned_at, last_seen_volatility, in_opportunity}}."""
+        rows = self.conn.execute(
+            "SELECT symbol, last_scanned_at, last_seen_volatility, in_opportunity FROM scan_state"
+        ).fetchall()
+        return {r["symbol"]: dict(r) for r in rows}
+
+    def upsert_scan_state(
+        self,
+        symbol: str,
+        last_scanned_at: Optional[str],
+        last_seen_volatility: float,
+        in_opportunity: bool,
+    ):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._write_lock:
+            self.conn.execute(
+                """
+                INSERT INTO scan_state (symbol, last_scanned_at, last_seen_volatility, in_opportunity, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    last_scanned_at = excluded.last_scanned_at,
+                    last_seen_volatility = excluded.last_seen_volatility,
+                    in_opportunity = excluded.in_opportunity,
+                    updated_at = excluded.updated_at
+                """,
+                (symbol, last_scanned_at, last_seen_volatility, 1 if in_opportunity else 0, now),
+            )
+            self.conn.commit()
 
     def close(self):
         self.conn.close()

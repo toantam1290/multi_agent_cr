@@ -59,7 +59,12 @@ class ExecutorAgent:
         return trade
 
     async def _paper_execute(self, signal: TradingSignal) -> Trade:
-        """Paper trading - simulate execution với giá thị trường tại thời điểm execute (không dùng giá cũ)"""
+        """
+        Paper trading - dùng signal.entry_price (pullback level) để maintain R:R.
+        Scalp: entry = pullback level → fill tại đó (simulate limit order).
+        Swing: entry = market → fill tại current + slippage.
+        """
+        from config import cfg
         from utils.market_data import BinanceDataFetcher
         fetcher = BinanceDataFetcher()
         try:
@@ -67,12 +72,30 @@ class ExecutorAgent:
         finally:
             await fetcher.close()
 
-        SLIPPAGE_PCT = 0.0015  # 0.15% mỗi chiều
+        SLIPPAGE_PCT = 0.0015  # 0.15% mỗi chiều (market)
+        LIMIT_SLIPPAGE_PCT = 0.0005  # 0.05% (limit fill)
         FEE_PCT = 0.001  # 0.1% mỗi chiều → 0.2% round trip
-        if signal.direction == Direction.LONG:
-            filled_price = current_price * (1 + SLIPPAGE_PCT)
+
+        # Scalp pullback entry: fill tại signal.entry_price (limit order simulated)
+        # Nếu giá đã vượt entry > 0.2% → limit không fill → simulate no fill (return None)
+        if cfg.scan.trading_style == "scalp":
+            if signal.direction == Direction.LONG and current_price > signal.entry_price * 1.002:
+                logger.warning(f"[PAPER] Scalp LONG: price ${current_price:,.2f} > entry*1.002 — no fill (limit missed)")
+                return None
+            if signal.direction == Direction.SHORT and current_price < signal.entry_price * 0.998:
+                logger.warning(f"[PAPER] Scalp SHORT: price ${current_price:,.2f} < entry*0.998 — no fill (limit missed)")
+                return None
+            if signal.direction == Direction.LONG:
+                filled_price = signal.entry_price * (1 + LIMIT_SLIPPAGE_PCT)
+            else:
+                filled_price = signal.entry_price * (1 - LIMIT_SLIPPAGE_PCT)
+            fill_type = "limit (pullback)"
         else:
-            filled_price = current_price * (1 - SLIPPAGE_PCT)
+            if signal.direction == Direction.LONG:
+                filled_price = current_price * (1 + SLIPPAGE_PCT)
+            else:
+                filled_price = current_price * (1 - SLIPPAGE_PCT)
+            fill_type = "market"
         quantity = signal.position_size_usdt / filled_price
         fee_cost = signal.position_size_usdt * FEE_PCT * 2  # Cả 2 chiều
 
@@ -92,9 +115,12 @@ class ExecutorAgent:
             is_paper=True,
         )
 
+        drift_pct = abs(filled_price - signal.entry_price) / signal.entry_price * 100 if signal.entry_price > 0 else 0
+        if drift_pct > 0.2:
+            logger.warning(f"[PAPER] Fill drift {drift_pct:.2f}% vs signal entry")
         logger.info(
             f"[PAPER] Trade opened: {signal.direction.value} {quantity:.6f} {signal.pair} "
-            f"@ ${filled_price:,.2f} (market)"
+            f"@ ${filled_price:,.2f} ({fill_type})"
         )
         return trade
 

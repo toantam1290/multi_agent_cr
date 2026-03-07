@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from loguru import logger
 
-from config import cfg
+from config import cfg, get_effective_approval_timeout_sec
 from models import TradingSignal, SignalStatus, Trade
 from database import Database
 
@@ -50,9 +50,9 @@ class TelegramNotifier:
 
             logger.info(f"Signal alert sent to Telegram: {signal.pair} (msg_id: {msg.message_id})")
 
-            # Auto-expire sau timeout
+            # Auto-expire sau timeout (scalp: 120s, swing: 300s)
             asyncio.create_task(
-                self._auto_expire_signal(short_id, cfg.trading.approval_timeout_sec)
+                self._auto_expire_signal(short_id, get_effective_approval_timeout_sec())
             )
             return True
 
@@ -66,7 +66,7 @@ class TelegramNotifier:
         await asyncio.sleep(timeout_sec)
         if short_id in self._pending_signals:
             signal = self._pending_signals.pop(short_id)
-            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED)
+            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED, cancel_reason="timeout")
             logger.info(f"Signal expired (timeout): {signal.pair} {signal.id[:8]}")
             await self.send_message(
                 f"⏰ Signal expired: *{signal.pair}* {signal.direction.value} "
@@ -188,12 +188,12 @@ class TelegramNotifier:
         signal_data = self.db.get_signal_by_short_id(short_id)
         if short_id in self._pending_signals:
             signal = self._pending_signals.pop(short_id)
-            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED)
+            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED, cancel_reason="user_skip")
             await update.message.reply_text(f"⏭️ Skipped: {signal.pair}")
             logger.info(f"Signal skipped: {signal.pair} {signal.id[:8]}")
         elif signal_data and signal_data.get("status") == "PENDING":
             signal = TradingSignal.model_validate(signal_data)
-            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED)
+            self.db.update_signal_status(signal.id, SignalStatus.SKIPPED, cancel_reason="user_skip")
             await update.message.reply_text(f"⏭️ Skipped: {signal.pair}")
             logger.info(f"Signal skipped (from DB): {signal.pair} {signal.id[:8]}")
         else:
@@ -268,6 +268,9 @@ class TelegramNotifier:
 
     async def stop(self):
         if self._app:
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+            except Exception as e:
+                logger.warning(f"Telegram stop: {e}")

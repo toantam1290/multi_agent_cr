@@ -2,6 +2,7 @@
 main.py - Entry point, orchestrate toàn bộ hệ thống
 """
 import asyncio
+import logging
 import signal as sys_signal
 import sys
 import threading
@@ -9,7 +10,10 @@ from datetime import datetime, date, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
 
-from config import cfg, ALLOWED_PAIRS
+# Giảm log APScheduler "job was missed" (chỉ trễ vài giây, job vẫn chạy)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+from config import cfg, ALLOWED_PAIRS, get_effective_approval_timeout_sec
 from database import Database
 from models import TradingSignal, SignalStatus, Trade, Direction, TradeStatus
 from agents.research_agent import ResearchAgent
@@ -55,7 +59,7 @@ class TradingOrchestrator:
         logger.info("=" * 60)
         logger.info("DeFi Trading Agent Starting...")
         logger.info(f"Paper Trading: {cfg.trading.paper_trading}")
-        logger.info(f"Min Confidence: {cfg.trading.min_confidence}")
+        logger.info(f"Min Confidence: {cfg.trading.min_confidence} (scalp: {cfg.trading.scalp_min_confidence})")
         logger.info(f"Max Position: {cfg.trading.max_position_pct*100}%")
         logger.info("=" * 60)
 
@@ -70,30 +74,40 @@ class TradingOrchestrator:
         self.db.ensure_daily_stats_row()
 
         # Expire stale PENDING signals (recovery sau restart)
-        self.db.expire_stale_pending_signals(cfg.trading.approval_timeout_sec)
+        self.db.expire_stale_pending_signals(get_effective_approval_timeout_sec())
 
-        # Start Telegram bot
-        await self.telegram.start_polling()
-        pair_names = [p.replace("USDT", "") for p in ALLOWED_PAIRS]
-        await self.telegram.send_message(
-            f"🤖 *Trading Agent Started*\n"
-            f"Mode: `{'PAPER' if cfg.trading.paper_trading else 'LIVE'}`\n"
-            f"Pairs: `{', '.join(pair_names)}`\n"
-            f"Scan interval: `every 15 min`"
-        )
+        # Start Telegram bot (skip nếu SKIP_TELEGRAM=true hoặc API bị chặn)
+        if not cfg.skip_telegram:
+            try:
+                await self.telegram.start_polling()
+                pair_names = [p.replace("USDT", "") for p in ALLOWED_PAIRS]
+                await self.telegram.send_message(
+                    f"🤖 *Trading Agent Started*\n"
+                    f"Mode: `{'PAPER' if cfg.trading.paper_trading else 'LIVE'}`\n"
+                    f"Pairs: `{', '.join(pair_names)}`\n"
+                    f"Scan interval: `every 15 min`"
+                )
+            except Exception as e:
+                logger.warning(f"Telegram unavailable ({e}), running without notifications")
+                self.telegram._bot = None
+        else:
+            logger.info("SKIP_TELEGRAM=true, running without Telegram")
 
-        # Setup scheduled jobs
+        # Setup scheduled jobs (scalp: 5 min scan, 1 min monitor | swing: 15 min, 2 min)
+        scan_min = cfg.scan.scan_interval_min
+        monitor_min = cfg.scan.position_monitor_interval_min
+        logger.info(f"Scan interval: {scan_min} min | Position monitor: {monitor_min} min ({cfg.scan.trading_style})")
         self.scheduler.add_job(
             self._scan_market,
             "interval",
-            minutes=15,
+            minutes=scan_min,
             id="market_scan",
             next_run_time=datetime.now(),  # Run immediately on start
         )
         self.scheduler.add_job(
             self._monitor_positions,
             "interval",
-            minutes=2,
+            minutes=monitor_min,
             id="position_monitor",
         )
         self.scheduler.add_job(
@@ -151,18 +165,23 @@ class TradingOrchestrator:
             await self.telegram.send_message(f"⚠️ Market scan error: {e}")
 
     async def _process_signal(self, signal: TradingSignal):
-        """Pipeline: Risk Check → Alert user → Wait for approval"""
+        """Pipeline: Risk Check → Alert user (or auto-execute if SKIP_TELEGRAM)"""
         # Risk check
         portfolio = self.risk_manager.get_portfolio_state()
         is_valid, reason = self.risk_manager.validate(signal, portfolio)
 
         if not is_valid:
-            self.db.update_signal_status(signal.id, SignalStatus.REJECTED)
+            self.db.update_signal_status(signal.id, SignalStatus.REJECTED, cancel_reason=f"risk_check:{reason[:100]}")
             logger.info(f"Signal rejected by Risk Manager: {reason}")
             return
 
-        # Forward to user via Telegram
-        await self.telegram.send_signal_alert(signal)
+        if cfg.skip_telegram:
+            # Không cần Telegram: auto-execute ngay (paper/live tùy config)
+            logger.info(f"SKIP_TELEGRAM=true: auto-executing signal {signal.pair} {signal.direction.value}")
+            await self._on_user_approve(signal)
+        else:
+            # Forward to user via Telegram, chờ /approve hoặc /skip
+            await self.telegram.send_signal_alert(signal)
 
     async def _on_user_approve(self, signal: TradingSignal):
         """Callback khi user approve signal"""
@@ -173,17 +192,40 @@ class TradingOrchestrator:
         is_valid, reason = self.risk_manager.validate(signal, portfolio)
 
         if not is_valid:
-            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED)
+            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED, cancel_reason=f"risk_check:{reason[:100]}")
             await self.telegram.send_message(
                 f"⚠️ Cannot execute: Risk check failed\n`{reason}`"
             )
             return
 
+        # Price freshness guard (scalp pullback entry): reject CHỈ khi SL bị phá
+        # LONG: reject nếu current < SL. SHORT: reject nếu current > SL.
+        # Lưu ý: current < entry (LONG) = limit fill tại giá tốt hơn → R:R cải thiện, KHÔNG reject.
+        if cfg.scan.trading_style == "scalp":
+            from utils.market_data import BinanceDataFetcher
+            fetcher = BinanceDataFetcher()
+            try:
+                current_price = await fetcher.get_current_price(signal.pair)
+                setup_broken = (
+                    (signal.direction == Direction.LONG and current_price < signal.stop_loss)
+                    or (signal.direction == Direction.SHORT and current_price > signal.stop_loss)
+                )
+                if setup_broken:
+                    self.db.update_signal_status(signal.id, SignalStatus.CANCELLED, cancel_reason="freshness_broke_sl")
+                    await self.telegram.send_message(
+                        f"⚠️ *Signal expired* — Price broke SL (setup invalidated)\n"
+                        f"Entry: ${signal.entry_price:,.2f} | SL: ${signal.stop_loss:,.2f} | Now: ${current_price:,.2f}"
+                    )
+                    logger.warning(f"Scalp signal rejected: price {current_price:.2f} broke SL {signal.stop_loss:.2f}")
+                    return
+            finally:
+                await fetcher.close()
+
         try:
             trade = await self.executor.execute(signal)
         except Exception as e:
             logger.error(f"Execution exception for {signal.pair}: {e}")
-            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED)
+            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED, cancel_reason=f"exec_error:{str(e)[:80]}")
             await self.telegram.send_message(f"❌ Execution error: `{e}`")
             return
 
@@ -198,10 +240,13 @@ class TradingOrchestrator:
                 f"Size: `${trade.position_size_usdt:,.0f} USDT`"
             )
         else:
-            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED)
-            await self.telegram.send_message(
-                f"❌ Execution failed for {signal.pair}. Check logs."
-            )
+            reason = "no_fill" if cfg.scan.trading_style == "scalp" else "exec_failed"
+            self.db.update_signal_status(signal.id, SignalStatus.CANCELLED, cancel_reason=reason)
+            msg = f"❌ Execution failed for {signal.pair}."
+            if cfg.scan.trading_style == "scalp":
+                msg += " (Paper: limit no fill — price moved past entry?)"
+            msg += " Check logs."
+            await self.telegram.send_message(msg)
 
     async def _monitor_positions(self):
         """Monitor open positions, check SL/TP (paper trading only)"""

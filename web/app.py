@@ -3,6 +3,7 @@ web/app.py - Web UI cho Trading Agent
 Chạy độc lập: python -m web.app
 Hoặc tích hợp vào main.py
 """
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -39,6 +40,7 @@ async def api_stats():
         "pending_signals": pending_count,
         "paper_trading": cfg.trading.paper_trading,
         "paper_balance_usdt": cfg.trading.paper_balance_usdt,
+        "trading_style": cfg.scan.trading_style,
     }
 
 
@@ -64,6 +66,48 @@ async def api_trade_history(limit: int = 50):
 async def api_logs(limit: int = 100):
     logs = db.get_recent_logs(limit)
     return {"logs": logs}
+
+
+@app.get("/api/opportunity")
+async def api_opportunity():
+    """Scan config + last funnel metrics từ agent_logs."""
+    sc = cfg.scan
+    config = {
+        "scan_mode": sc.scan_mode,
+        "trading_style": sc.trading_style,
+        "scan_interval_min": sc.scan_interval_min,
+        "position_monitor_interval_min": sc.position_monitor_interval_min,
+        "scan_dry_run": sc.scan_dry_run,
+        "opportunity_volatility_pct": sc.opportunity_volatility_pct,
+        "opportunity_volatility_max_pct": sc.opportunity_volatility_max_pct,
+        "min_quote_volume_usd": sc.min_quote_volume_usd,
+        "max_pairs_per_scan": sc.max_pairs_per_scan,
+        "core_pairs": sc.core_pairs,
+        "scalp_1h_range_min_pct": sc.scalp_1h_range_min_pct,
+        "scalp_active_hours_utc": sc.scalp_active_hours_utc or "(24/7)",
+    }
+    # Lấy funnel gần nhất từ logs
+    logs = db.get_recent_logs(limit=100)
+    last_funnel = None
+    last_funnel_time = None
+    for l in logs:
+        if l.get("message") == "Scan cycle funnel" and l.get("data"):
+            try:
+                data = json.loads(l["data"]) if isinstance(l["data"], str) else l["data"]
+                last_funnel = data
+                last_funnel_time = l.get("timestamp")
+                break
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return {"config": config, "last_funnel": last_funnel, "last_funnel_time": last_funnel_time}
+
+
+@app.get("/api/daily-dashboard")
+async def api_daily_dashboard(days: int = 7):
+    """Daily metrics + quality score (spec 006)."""
+    from utils.daily_metrics_report import get_dashboard_data
+    data = get_dashboard_data(days=days)
+    return {"days": days, "rows": data}
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080):
