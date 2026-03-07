@@ -105,6 +105,7 @@ class Database:
             "ALTER TABLE signals ADD COLUMN model_version TEXT",
             "ALTER TABLE trades ADD COLUMN fees_usdt REAL",
             "ALTER TABLE signals ADD COLUMN cancel_reason TEXT",
+            "ALTER TABLE trades ADD COLUMN sl_trailing_state TEXT DEFAULT 'original'",
         ]
         with self._write_lock:
             for sql in migrations:
@@ -267,12 +268,13 @@ class Database:
 
     def save_trade(self, trade: Trade):
         with self._write_lock:
+            sl_state = getattr(trade, "sl_trailing_state", "original")
             self.conn.execute("""
             INSERT OR REPLACE INTO trades
             (id, signal_id, pair, direction, entry_price, stop_loss,
              take_profit, quantity, position_size_usdt, binance_order_id,
-             status, opened_at, closed_at, exit_price, pnl_usdt, pnl_pct, fees_usdt, is_paper)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, opened_at, closed_at, exit_price, pnl_usdt, pnl_pct, fees_usdt, is_paper, sl_trailing_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade.id, trade.signal_id, trade.pair, trade.direction.value,
             trade.entry_price, trade.stop_loss, trade.take_profit,
@@ -282,9 +284,19 @@ class Database:
             trade.exit_price, trade.pnl_usdt, trade.pnl_pct,
             trade.fees_usdt,
             1 if trade.is_paper else 0,
+            sl_state,
         ))
             self.conn.commit()
             self._inc_daily_stat("executed_trades")
+
+    def update_trade_sl(self, trade_id: str, new_sl: float, sl_trailing_state: str):
+        """Update stop_loss và sl_trailing_state (trail stop)."""
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE trades SET stop_loss=?, sl_trailing_state=? WHERE id=? AND status='OPEN'",
+                (new_sl, sl_trailing_state, trade_id),
+            )
+            self.conn.commit()
 
     def close_trade(
         self,

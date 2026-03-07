@@ -59,6 +59,17 @@ class TechnicalSignal(BaseModel):
     bb_width: float = 0.0       # Bollinger bandwidth
     bb_width_regime: float = 0.0   # Cho classify_regime: scalp = 1h, swing = 1h
     atr_ratio_regime: float = 0.0  # Cho classify_regime: scalp = 1h, swing = 1h
+    current_price: float = 0.0   # Close của nến cuối (df_fast) — swing dùng thay get_current_price
+    # Scalp: swing structure cho SL, entry timing
+    swing_low: float = 0.0       # Min low của 10 nến 5m gần nhất
+    swing_high: float = 0.0      # Max high của 10 nến 5m gần nhất
+    ema9_just_crossed_up: bool = False   # Close vừa cross lên EMA9 (legacy, quá strict)
+    ema9_just_crossed_down: bool = False  # Close vừa cross xuống EMA9 (legacy)
+    ema9_crossed_recent_up: bool = False   # Cross lên trong 3 nến gần nhất (nới hơn)
+    ema9_crossed_recent_down: bool = False  # Cross xuống trong 3 nến gần nhất
+    # Order flow (production scalping)
+    vwap: float = 0.0                   # VWAP intraday
+    vwap_distance_pct: float = 0.0       # % distance, dương = trên VWAP
 
 
 class WhaleSignal(BaseModel):
@@ -216,6 +227,7 @@ class Trade(BaseModel):
     pnl_pct: Optional[float] = None
     fees_usdt: Optional[float] = None  # Slippage + trading fee
     is_paper: bool = True
+    sl_trailing_state: str = "original"  # original | breakeven | locked_50 (trail stop)
 
 
 # ─── Portfolio State ──────────────────────────────────────────────────────────

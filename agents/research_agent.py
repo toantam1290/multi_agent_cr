@@ -76,6 +76,7 @@ class ResearchAgent:
         self.whale = WhaleDataFetcher()
         self.fear_greed = FearGreedFetcher()
         self._claude_semaphore = asyncio.Semaphore(2)  # Tối đa 2 Claude calls song song (tránh budget race)
+        self._pair_semaphore = asyncio.Semaphore(5)  # Tối đa 5 pairs phân tích đồng thời (tránh Binance throttle)
         logger.info("ResearchAgent initialized")
 
     def _rule_based_filter(
@@ -135,30 +136,95 @@ class ResearchAgent:
             return "SHORT"
         return None
 
-    async def analyze_pair(self, pair: str) -> tuple[Optional[TradingSignal], dict]:
+    async def analyze_pair(
+        self,
+        pair: str,
+        prefetched_sentiment: Optional[SentimentSignal] = None,
+        session: Optional[str] = None,
+    ) -> tuple[Optional[TradingSignal], dict]:
+        """Wrapper: gate với _pair_semaphore, tối đa 5 pairs phân tích đồng thời."""
+        async with self._pair_semaphore:
+            return await self._analyze_pair_inner(pair, prefetched_sentiment, session)
+
+    async def _analyze_pair_inner(
+        self,
+        pair: str,
+        prefetched_sentiment: Optional[SentimentSignal] = None,
+        session: Optional[str] = None,
+    ) -> tuple[Optional[TradingSignal], dict]:
         """
         Phân tích một cặp tiền → trả về (TradingSignal | None, metadata).
         metadata: {rule_passed, claude_proceed} cho observability.
         """
         logger.info(f"Analyzing {pair}...")
-        meta = {"rule_passed": False, "claude_proceed": False}
+        meta = {"rule_passed": False, "claude_proceed": False, "ema9_rejected": False, "confluence_rejected": False}
 
         try:
-            # 1. Thu thập data song song (thêm derivatives)
+            # 1. Thu thập data song song (Fear & Greed prefetch khi có)
             style = cfg.scan.trading_style
             whale_hours = cfg.scan.scalp_whale_hours if style == "scalp" else 4
-            current_price, technical, whale_data, sentiment, derivatives = await asyncio.gather(
-                self.binance.get_current_price(pair),
-                self.binance.compute_technical_signal(pair, style=style),
-                self.whale.get_whale_transactions(pair, hours_back=whale_hours),
-                self.fear_greed.get(),
-                self.binance.get_derivatives_signal(pair),
-            )
+            relax = getattr(cfg.scan, "relax_filter", False)  # Define sớm — dùng cho CVD, VWAP, EMA9, confluence
+
+            # Swing: dùng technical.current_price (từ klines close), tiết kiệm 1 req/pair
+            # Scalp: cần real-time tick vì entry pullback thay đổi nhanh trong 5 phút
+            if prefetched_sentiment is not None:
+                if style == "scalp":
+                    current_price, technical, whale_data, derivatives, ob_data, cvd = await asyncio.gather(
+                        self.binance.get_current_price(pair),
+                        self.binance.compute_technical_signal(pair, style=style),
+                        self.whale.get_whale_transactions(pair, hours_back=whale_hours),
+                        self.binance.get_derivatives_signal(pair),
+                        self.binance.get_orderbook_data(pair),
+                        self.binance.get_cvd_signal(pair, limit=500),
+                    )
+                    spread_pct = ob_data["spread_pct"]
+                    ob_imbalance = ob_data["imbalance"]
+                else:
+                    technical, whale_data, derivatives = await asyncio.gather(
+                        self.binance.compute_technical_signal(pair, style=style),
+                        self.whale.get_whale_transactions(pair, hours_back=whale_hours),
+                        self.binance.get_derivatives_signal(pair),
+                    )
+                    current_price = technical.current_price
+                    spread_pct = 0.0
+                    ob_imbalance = 1.0
+                    cvd = {"cvd_ratio": 0.5, "cvd_trend": "neutral"}
+                sentiment = prefetched_sentiment
+            else:
+                if style == "scalp":
+                    current_price, technical, whale_data, sentiment, derivatives, ob_data, cvd = await asyncio.gather(
+                        self.binance.get_current_price(pair),
+                        self.binance.compute_technical_signal(pair, style=style),
+                        self.whale.get_whale_transactions(pair, hours_back=whale_hours),
+                        self.fear_greed.get(),
+                        self.binance.get_derivatives_signal(pair),
+                        self.binance.get_orderbook_data(pair),
+                        self.binance.get_cvd_signal(pair, limit=500),
+                    )
+                    spread_pct = ob_data["spread_pct"]
+                    ob_imbalance = ob_data["imbalance"]
+                else:
+                    technical, whale_data, sentiment, derivatives = await asyncio.gather(
+                        self.binance.compute_technical_signal(pair, style=style),
+                        self.whale.get_whale_transactions(pair, hours_back=whale_hours),
+                        self.fear_greed.get(),
+                        self.binance.get_derivatives_signal(pair),
+                    )
+                    current_price = technical.current_price
+                    spread_pct = 0.0
+                    ob_imbalance = 1.0
+                    cvd = {"cvd_ratio": 0.5, "cvd_trend": "neutral"}
             logger.info(
                 f"{pair} | Price: ${current_price:,.2f} | "
                 f"Tech: {technical.net_score} | Whale: {whale_data.score} | "
                 f"Funding: {derivatives.funding_rate*100:.3f}% | F&G: {sentiment.fear_greed_index}"
             )
+
+            # 1b. Scalp: spread check sớm — bỏ qua illiquid pair trước các bước tốn CPU
+            if style == "scalp" and not relax and spread_pct > 0.05:
+                logger.info(f"{pair}: Spread {spread_pct:.3f}% > 0.05%, skip")
+                self.db.log("research_agent", "INFO", f"Skip {pair}: spread", {"pair": pair, "spread": spread_pct})
+                return None, meta
 
             # 2. Rule-based filter — không pass thì skip Claude
             direction = self._rule_based_filter(technical, derivatives, style=style, pair=pair)
@@ -168,6 +234,39 @@ class ResearchAgent:
                 return None, meta
 
             meta["rule_passed"] = True
+
+            # 2a. Scalp: CVD divergence — giá bullish nhưng seller đang dominate = fake move
+            if style == "scalp" and not relax:
+                if direction == "LONG" and cvd["cvd_ratio"] < 0.45:
+                    logger.info(f"{pair}: CVD divergence — price bullish but sellers dominating ({cvd['cvd_ratio']:.2f}), skip")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: CVD divergence", {"pair": pair, "cvd_ratio": cvd["cvd_ratio"]})
+                    return None, meta
+                if direction == "SHORT" and cvd["cvd_ratio"] > 0.55:
+                    logger.info(f"{pair}: CVD divergence — price bearish but buyers dominating ({cvd['cvd_ratio']:.2f}), skip")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: CVD divergence", {"pair": pair, "cvd_ratio": cvd["cvd_ratio"]})
+                    return None, meta
+
+            # 2b. Scalp: VWAP bias — LONG khi giá gần/dưới VWAP, SHORT khi gần/trên
+            if style == "scalp" and not relax:
+                vd = technical.vwap_distance_pct
+                if direction == "LONG" and vd > 1.5:
+                    logger.info(f"{pair}: Price {vd:.1f}% above VWAP — overextended, skip LONG")
+                    return None, meta
+                if direction == "SHORT" and vd < -1.5:
+                    logger.info(f"{pair}: Price {vd:.1f}% below VWAP — overextended, skip SHORT")
+                    return None, meta
+
+            # 2c. Scalp: entry timing — cross EMA9 trong 3 nến gần nhất (nới hơn "just crossed")
+            if style == "scalp" and not relax:
+                timing_ok = (
+                    (direction == "LONG" and technical.ema9_crossed_recent_up)
+                    or (direction == "SHORT" and technical.ema9_crossed_recent_down)
+                )
+                if not timing_ok:
+                    meta["ema9_rejected"] = True
+                    logger.info(f"{pair}: Entry timing — chưa cross EMA9 trong 3 nến, skip")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: timing", {"pair": pair})
+                    return None, meta
 
             # 3. Regime (ADX + BB + ATR) — dùng bb_width_regime, atr_ratio_regime (scalp = 1h nhất quán)
             regime = classify_regime(
@@ -185,6 +284,53 @@ class ResearchAgent:
                 logger.warning(f"{pair}: ATR invalid ({technical.atr_value}), skipping")
                 return None, meta
 
+            # 3b. Confluence check — ít nhất 3/6 yếu tố align trước khi gọi Claude (RELAX: bỏ qua)
+            confluence_score = 0
+            if direction == "LONG" and technical.trend_1d == "uptrend":
+                confluence_score += 1
+            if direction == "SHORT" and technical.trend_1d == "downtrend":
+                confluence_score += 1
+            if technical.volume_spike or technical.volume_trend_up:
+                confluence_score += 1
+            if direction == "LONG" and derivatives.funding_rate < 0.0002:
+                confluence_score += 1
+            if direction == "SHORT" and derivatives.funding_rate > 0.0002:
+                confluence_score += 1
+            if direction == "LONG" and whale_data.net_flow > 0:
+                confluence_score += 1
+            if direction == "SHORT" and whale_data.net_flow < 0:
+                confluence_score += 1
+            # OI + trend: chỉ cộng khi OI tăng VÀ trend aligned (fresh longs trong uptrend / shorts trong downtrend)
+            if derivatives.oi_change_pct > 5 and (
+                (direction == "LONG" and technical.trend_1d == "uptrend")
+                or (direction == "SHORT" and technical.trend_1d == "downtrend")
+            ):
+                confluence_score += 1
+            # CVD + orderbook imbalance (order flow)
+            if direction == "LONG" and cvd["cvd_ratio"] > 0.55:
+                confluence_score += 1
+            if direction == "SHORT" and cvd["cvd_ratio"] < 0.45:
+                confluence_score += 1
+            if direction == "LONG" and cvd["cvd_trend"] == "accelerating_buy":
+                confluence_score += 1
+            if direction == "SHORT" and cvd["cvd_trend"] == "accelerating_sell":
+                confluence_score += 1
+            if direction == "LONG" and ob_imbalance > 1.5:
+                confluence_score += 1
+            if direction == "SHORT" and ob_imbalance < 0.7:
+                confluence_score += 1
+            # VWAP mean reversion
+            if direction == "LONG" and -0.5 <= technical.vwap_distance_pct <= 0:
+                confluence_score += 1
+            if direction == "SHORT" and 0 <= technical.vwap_distance_pct <= 0.5:
+                confluence_score += 1
+            MIN_CONFLUENCE = 3  # Cân nhắc nâng 4/9 khi có data thực tế
+            if not relax and confluence_score < MIN_CONFLUENCE:
+                meta["confluence_rejected"] = True
+                logger.info(f"{pair}: Confluence {confluence_score}/9 < {MIN_CONFLUENCE}, skip Claude")
+                self.db.log("research_agent", "INFO", f"Confluence low {pair}", {"pair": pair, "score": confluence_score})
+                return None, meta
+
             # 4. Position size check TRƯỚC Claude (tránh lãng phí budget khi available=0)
             available = await self._get_available_balance()
             position_size = min(
@@ -195,17 +341,29 @@ class ResearchAgent:
                 logger.info(f"{pair}: Position size too small (${position_size:.2f}), skipping (pre-Claude)")
                 return None, meta
 
-            # 5. Calc entry/SL/TP (rule-based, ATR)
+            # 5. Calc entry/SL/TP (rule-based, ATR hoặc swing structure)
             rr_ratio = cfg.trading.scalp_risk_reward_ratio if style == "scalp" else None
-            entry, sl, tp = calc_entry_sl_tp(
+            result = calc_entry_sl_tp(
                 direction, current_price, technical.atr_value, regime,
                 style=style, rr_ratio=rr_ratio,
+                swing_low=technical.swing_low,
+                swing_high=technical.swing_high,
             )
+            if result is None:
+                logger.info(f"{pair}: SL structure quá xa — setup không hợp lệ")
+                self.db.log("research_agent", "INFO", f"Skip {pair}: structure", {"pair": pair})
+                return None, meta
+            entry, sl, tp = result
 
             # 6. Claude risk assessment (pre-mortem)
             analysis = await self._claude_analyze(
                 pair, current_price, technical, whale_data, sentiment, derivatives,
                 direction, entry, sl, tp, regime, style=style,
+                confluence_score=confluence_score,
+                spread_pct=spread_pct,
+                cvd=cvd,
+                ob_imbalance=ob_imbalance,
+                session=session if style == "scalp" else None,
             )
 
             if not analysis or not analysis.get("should_trade"):
@@ -288,6 +446,11 @@ class ResearchAgent:
         tp: float,
         regime: str,
         style: str = "swing",
+        confluence_score: int = 0,
+        spread_pct: float = 0.0,
+        cvd: dict | None = None,
+        ob_imbalance: float = 1.0,
+        session: str | None = None,
     ) -> Optional[dict]:
         """Claude pre-mortem risk assessment. Entry/SL/TP đã tính sẵn (rule-based)."""
 
@@ -309,9 +472,12 @@ class ResearchAgent:
             risk_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0
             reward_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0
             entry_gap_pct = (entry - current_price) / current_price * 100 if current_price > 0 else 0
+            sl_atr_mult = abs(entry - sl) / technical.atr_value if technical.atr_value > 0 else 0
 
             rsi_label = "RSI 15m / RSI 5m (timing)" if style == "scalp" else "RSI 1h / RSI 4h"
             rsi_vals = f"{technical.rsi_1h:.1f} / {technical.rsi_4h:.1f}"
+
+            ema9_timing = "yes" if (technical.ema9_crossed_recent_up or technical.ema9_crossed_recent_down) else "no"
 
             user_prompt = f"""
 Pre-mortem risk assessment cho {pair} ({style.upper()}):
@@ -322,6 +488,7 @@ PROPOSED SETUP ({direction}):
 - Take Profit: ${tp:,.2f} (+{reward_pct:.1f}%)
 - Regime: {regime}
 - Entry gap: {entry_gap_pct:+.2f}% from current (pullback limit — needs retrace to fill)
+- SL distance: {sl_atr_mult:.1f}×ATR (swing structure based)
 
 DATA:
 - Price: ${current_price:,.2f} | Trend 4h: {technical.trend_1d}
@@ -330,6 +497,11 @@ DATA:
 {f'- momentum_triggered: true (scalp RSI 2-candle — required gate passed)' if style == 'scalp' else ''}
 - Funding: {derivatives.funding_rate*100:.3f}% | Basis: {derivatives.basis_pct:.2f}%
 - F&G: {sentiment.fear_greed_index}/100 | Net flow: ${whale.net_flow/1e6:.1f}M
+- Confluence: {confluence_score}/9 | EMA9 crossed recent (3 nến): {ema9_timing}
+- Spread: {spread_pct:.3f}% | OI change 24h: {derivatives.oi_change_pct:+.1f}%
+- CVD ratio: {(cvd or {}).get('cvd_ratio', 0.5):.2f} | CVD trend: {(cvd or {}).get('cvd_trend', 'neutral')}
+- Orderbook imbalance: {ob_imbalance:.2f} | VWAP distance: {technical.vwap_distance_pct:+.1f}%
+{f'- Session: {session}' if session else ''}
 
 1. Top 3 risks invalidate trade?
 2. Most likely failure mode?
@@ -550,6 +722,38 @@ DATA:
             logger.info("No pairs to scan")
             return []
 
+        # Session (UTC): asia 0-8, london 8-13, ny_overlap 13-20, dead_zone 20-24 (sau US close)
+        hour_utc = datetime.now(timezone.utc).hour
+        session = "london" if 8 <= hour_utc < 13 else ("ny_overlap" if 13 <= hour_utc < 20 else ("asia" if hour_utc < 8 else "dead_zone"))
+
+        # Scalp: Session filter — dead_zone skip, asia=core only, london+ny=all
+        if sc.trading_style == "scalp" and sc.scalp_session_filter and not getattr(sc, "relax_filter", False):
+            if session == "dead_zone":
+                logger.info(f"Session={session} (UTC {hour_utc}h): skip scalp cycle")
+                return []
+            elif session == "asia":
+                core = set(sc.core_pairs or ["BTCUSDT", "ETHUSDT"])
+                pairs_to_scan = [p for p in pairs_to_scan if p in core]
+                logger.info(f"Asia session: filtered to {len(pairs_to_scan)} core pairs only")
+            if not pairs_to_scan:
+                return []
+
+        # Scalp: BTC volatility filter — khi BTC quá volatile, altcoin bị kéo theo, chỉ trade BTC/ETH
+        if sc.trading_style == "scalp" and len(pairs_to_scan) > 0:
+            try:
+                btc_tech = await self.binance.compute_technical_signal("BTCUSDT", style="scalp")
+                if btc_tech.atr_pct > 0.5:  # 0.5% chưa validated, bắt đầu conservative
+                    core = set(sc.core_pairs or ["BTCUSDT", "ETHUSDT"])
+                    filtered = [p for p in pairs_to_scan if p in core]
+                    if filtered != pairs_to_scan:
+                        logger.info(
+                            f"BTC ATR% {btc_tech.atr_pct:.2f}% > 0.5% — chỉ scan BTC/ETH, "
+                            f"{len(pairs_to_scan)} → {len(filtered)} pairs"
+                        )
+                        pairs_to_scan = filtered
+            except Exception as e:
+                logger.warning(f"BTC volatility filter failed: {e}, scan all pairs")
+
         # Dry-run: chỉ log, không analyze
         if sc.scan_dry_run:
             logger.info(f"DRY-RUN: would scan {pairs_to_scan}")
@@ -561,15 +765,25 @@ DATA:
             )
             return []
 
-        # Chạy song song để giảm latency (1 pair lỗi không block các pair khác)
+        # Fear & Greed: fetch 1 lần cho cả cycle (daily index, giống nhau mọi pair)
+        try:
+            shared_sentiment = await self.fear_greed.get()
+            logger.info(f"Fear & Greed: {shared_sentiment.fear_greed_index} ({shared_sentiment.fear_greed_label})")
+        except Exception as e:
+            logger.warning(f"Fear & Greed pre-fetch failed: {e}, fallback fetch riêng từng pair")
+            shared_sentiment = None
+
+        # _pair_semaphore tự động chia batch 5 — tối đa 5 pairs đồng thời
         results = await asyncio.gather(
-            *[self.analyze_pair(pair) for pair in pairs_to_scan],
+            *[self.analyze_pair(pair, prefetched_sentiment=shared_sentiment, session=session) for pair in pairs_to_scan],
             return_exceptions=True,
         )
 
         signals = []
         rule_based_passed = 0
         claude_passed = 0
+        ema9_rejected = 0
+        confluence_rejected = 0
         opportunity_candidates = len(pairs_to_scan) if sc.scan_mode == "opportunity" else 0
 
         for pair, result in zip(pairs_to_scan, results):
@@ -582,16 +796,23 @@ DATA:
                 rule_based_passed += 1
             if meta.get("claude_proceed"):
                 claude_passed += 1
+            if meta.get("ema9_rejected"):
+                ema9_rejected += 1
+            if meta.get("confluence_rejected"):
+                confluence_rejected += 1
             if signal:  # analyze_pair đã filter confidence >= min_conf
                 signals.append(signal)
 
         # Observability: log funnel metrics mỗi cycle
         funnel = {
             "scan_mode": sc.scan_mode,
+            "session": session if sc.trading_style == "scalp" else None,
             "opportunity_candidates": opportunity_candidates,
             "pairs_scanned": len(pairs_to_scan),
             "pairs_scanned_list": pairs_to_scan,  # Để UI hiển thị pair nào được scan
             "rule_based_passed": rule_based_passed,
+            "ema9_rejected": ema9_rejected,
+            "confluence_rejected": confluence_rejected,
             "claude_passed": claude_passed,
             "signals_generated": len(signals),
             "fallback_used": fallback_used,

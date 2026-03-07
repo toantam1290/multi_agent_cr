@@ -94,6 +94,93 @@ class BinanceDataFetcher:
         resp.raise_for_status()
         return float(resp.json()["price"])
 
+    async def get_orderbook_spread_pct(self, symbol: str) -> float:
+        """Spread % = (best_ask - best_bid) / best_bid * 100. > 0.05% → illiquid."""
+        data = await self.get_orderbook_data(symbol)
+        return data["spread_pct"]
+
+    async def get_orderbook_data(self, symbol: str) -> dict:
+        """
+        Fetch 1 lần, trả về spread + imbalance.
+        Imbalance = bid_volume_5_levels / ask_volume_5_levels
+        > 1.5 = buyer stack nặng = LONG bias, < 0.7 = SHORT bias
+        """
+        try:
+            resp = await _http_get_with_retry(
+                self._client, f"{self.base}/depth", params={"symbol": symbol, "limit": 5}
+            )
+            resp.raise_for_status()
+            book = resp.json()
+            bids = book.get("bids", [])[:5]
+            asks = book.get("asks", [])[:5]
+            if not bids or not asks:
+                return {"spread_pct": 999.0, "imbalance": 1.0, "bid_stack": 0.0, "ask_stack": 0.0}
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            spread_pct = (best_ask - best_bid) / best_bid * 100 if best_bid > 0 else 999.0
+            bid_stack = sum(float(b[1]) for b in bids)
+            ask_stack = sum(float(a[1]) for a in asks)
+            imbalance = bid_stack / ask_stack if ask_stack > 0 else 1.0
+            return {
+                "spread_pct": spread_pct,
+                "imbalance": imbalance,
+                "bid_stack": bid_stack,
+                "ask_stack": ask_stack,
+            }
+        except Exception as e:
+            logger.warning(f"get_orderbook_data failed for {symbol}: {e}")
+            return {"spread_pct": 999.0, "imbalance": 1.0, "bid_stack": 0.0, "ask_stack": 0.0}
+
+    async def get_cvd_signal(self, symbol: str, limit: int = 500) -> dict:
+        """
+        CVD từ aggTrades — buy_vol - sell_vol.
+        isBuyerMaker=False (m=0) → market BUY → CVD tăng
+        isBuyerMaker=True (m=1) → market SELL → CVD giảm
+        """
+        try:
+            resp = await _http_get_with_retry(
+                self._client, f"{self.base}/aggTrades", params={"symbol": symbol, "limit": limit}
+            )
+            resp.raise_for_status()
+            trades = resp.json()
+            if not trades:
+                return {"cvd": 0.0, "cvd_ratio": 0.5, "buy_vol": 0.0, "sell_vol": 0.0, "cvd_trend": "neutral"}
+
+            buy_vol = sum(float(t["q"]) for t in trades if not t["m"])
+            sell_vol = sum(float(t["q"]) for t in trades if t["m"])
+            total_vol = buy_vol + sell_vol
+            cvd = buy_vol - sell_vol
+            cvd_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+
+            mid = len(trades) // 2
+            early_buy = sum(float(t["q"]) for t in trades[:mid] if not t["m"])
+            early_sell = sum(float(t["q"]) for t in trades[:mid] if t["m"])
+            late_buy = sum(float(t["q"]) for t in trades[mid:] if not t["m"])
+            late_sell = sum(float(t["q"]) for t in trades[mid:] if t["m"])
+            early_cvd = early_buy - early_sell
+            late_cvd = late_buy - late_sell
+
+            # Delta-based: tránh bug khi early_cvd âm (nhân 1.2 đảo chiều so sánh)
+            threshold = total_vol * 0.05
+            if late_cvd - early_cvd > threshold:
+                cvd_trend = "accelerating_buy"
+            elif early_cvd - late_cvd > threshold:
+                cvd_trend = "accelerating_sell"
+            else:
+                cvd_trend = "neutral"
+
+            logger.debug(f"{symbol} CVD | buy={buy_vol:.1f} sell={sell_vol:.1f} ratio={cvd_ratio:.2f} trend={cvd_trend}")
+            return {
+                "cvd": cvd,
+                "cvd_ratio": cvd_ratio,
+                "buy_vol": buy_vol,
+                "sell_vol": sell_vol,
+                "cvd_trend": cvd_trend,
+            }
+        except Exception as e:
+            logger.warning(f"get_cvd_signal failed for {symbol}: {e}")
+            return {"cvd": 0.0, "cvd_ratio": 0.5, "buy_vol": 0.0, "sell_vol": 0.0, "cvd_trend": "neutral"}
+
     async def get_24h_stats(self, symbol: str) -> dict:
         resp = await self._client.get(f"{self.base}/ticker/24hr", params={"symbol": symbol})
         resp.raise_for_status()
@@ -273,7 +360,7 @@ class BinanceDataFetcher:
             df_fast, df_slow, df_trend = await asyncio.gather(
                 self.get_klines(symbol, "1h", 100),
                 self.get_klines(symbol, "4h", 100),
-                self.get_klines(symbol, "1d", 210),
+                self.get_klines(symbol, "1d", 400),  # EMA200 cần ~400 candle warm-up
             )
             df_atr = df_fast  # swing: ATR từ 1h
             df_adx = df_slow # swing: ADX từ 4h
@@ -313,13 +400,47 @@ class BinanceDataFetcher:
         ema21 = ta.ema(df_fast["close"], length=21)
         ema_cross_bullish = False
         ema_cross_bearish = False
-        if ema9 is not None and ema21 is not None and len(ema9) >= 2 and len(ema21) >= 2:
+        ema9_just_crossed_up = False
+        ema9_just_crossed_down = False
+        ema9_crossed_recent_up = False
+        ema9_crossed_recent_down = False
+        if ema9 is not None and ema21 is not None and len(ema9) >= 6 and len(ema21) >= 6:
             e9, e21 = float(ema9.iloc[-1]), float(ema21.iloc[-1])
             close = float(df_fast["close"].iloc[-1])
+            prev_close = float(df_fast["close"].iloc[-2])
+            prev_e9 = float(ema9.iloc[-2])
             cross_bull = e9 > e21 and float(ema9.iloc[-2]) <= float(ema21.iloc[-2])
             cross_bear = e9 < e21 and float(ema9.iloc[-2]) >= float(ema21.iloc[-2])
             ema_cross_bullish = cross_bull and close > e21  # Price confirm
             ema_cross_bearish = cross_bear and close < e21
+            # Entry timing: close vừa cross EMA9 (legacy, quá strict)
+            ema9_just_crossed_up = close > e9 and prev_close <= prev_e9
+            ema9_just_crossed_down = close < e9 and prev_close >= prev_e9
+            # Nới: cross trong 3 nến đã đóng gần nhất (iloc[-2,-3,-4]) — tránh nến chưa đóng
+            for i in range(2, 5):  # i=2,3,4 → check candles -2,-3,-4 (đã đóng)
+                if len(ema9) <= i + 1 or len(df_fast["close"]) <= i + 1:
+                    break
+                c, c_prev = float(df_fast["close"].iloc[-i]), float(df_fast["close"].iloc[-i - 1])
+                e, e_prev = float(ema9.iloc[-i]), float(ema9.iloc[-i - 1])
+                if c > e and c_prev <= e_prev:
+                    ema9_crossed_recent_up = True
+                if c < e and c_prev >= e_prev:
+                    ema9_crossed_recent_down = True
+
+        # Swing structure (10 nến gần nhất) — cho SL từ structure thay vì ATR flat
+        recent_atr = df_atr.iloc[-10:] if len(df_atr) >= 10 else df_atr
+        swing_low = float(recent_atr["low"].min()) if len(recent_atr) > 0 else 0.0
+        swing_high = float(recent_atr["high"].max()) if len(recent_atr) > 0 else 0.0
+
+        # VWAP intraday (HLC/3 chuẩn hơn close)
+        vwap_val = 0.0
+        vwap_distance_pct = 0.0
+        if len(df_atr) > 0 and df_atr["volume"].sum() > 0:
+            typical = (df_atr["high"] + df_atr["low"] + df_atr["close"]) / 3
+            vwap_val = float((typical * df_atr["volume"]).sum() / df_atr["volume"].sum())
+            current_price_val = float(df_atr["close"].iloc[-1])
+            if vwap_val > 0:
+                vwap_distance_pct = (current_price_val - vwap_val) / vwap_val * 100
 
         # MACD
         macd_df = ta.macd(df_fast["close"])
@@ -398,10 +519,10 @@ class BinanceDataFetcher:
             if rsi_4h > 70 and trend_1d == "downtrend":
                 bearish += 10
             # Scalp: BỎ EMA cross + MACD (lagging), thêm RSI momentum + candle body
-            # RSI momentum: 2 nến liên tiếp tăng + delta > 2.0 (loại noise)
+            # RSI momentum: 2 nến đã đóng liên tiếp tăng + delta > 2.0 (dùng iloc[-2,-3,-4])
             rsi_series = ta.rsi(df_fast["close"], length=14)
-            if rsi_series is not None and len(rsi_series) >= 3:
-                r0, r1, r2 = float(rsi_series.iloc[-1]), float(rsi_series.iloc[-2]), float(rsi_series.iloc[-3])
+            if rsi_series is not None and len(rsi_series) >= 4:
+                r0, r1, r2 = float(rsi_series.iloc[-2]), float(rsi_series.iloc[-3]), float(rsi_series.iloc[-4])
                 if rsi_1h < 45 and r0 > r1 and r1 > r2 and (r0 - r2) > 2.0:
                     bullish += 15
                     momentum_bullish = True
@@ -490,6 +611,7 @@ class BinanceDataFetcher:
                 if a50 > 0:
                     atr_ratio_regime = float(atr14_1h.iloc[-1]) / a50
 
+        current_price = float(df_fast["close"].iloc[-1])
         return TechnicalSignal(
             rsi_1h=rsi_1h,
             rsi_4h=rsi_4h,
@@ -516,6 +638,15 @@ class BinanceDataFetcher:
             bb_width=bb_width,
             bb_width_regime=bb_width_regime,
             atr_ratio_regime=atr_ratio_regime,
+            current_price=current_price,
+            swing_low=swing_low,
+            swing_high=swing_high,
+            ema9_just_crossed_up=ema9_just_crossed_up,
+            ema9_just_crossed_down=ema9_just_crossed_down,
+            ema9_crossed_recent_up=ema9_crossed_recent_up,
+            ema9_crossed_recent_down=ema9_crossed_recent_down,
+            vwap=vwap_val,
+            vwap_distance_pct=vwap_distance_pct,
         )
 
     async def close(self):
@@ -608,7 +739,17 @@ def get_opportunity_pairs(
         if score < confluence_min_score:
             continue
 
-        candidates.append({"symbol": symbol, "priceChangePercent": pct, "quoteVolume": qv})
+        last_price = _safe_float(t.get("lastPrice"))
+        high_price = _safe_float(t.get("highPrice"))
+        low_price = _safe_float(t.get("lowPrice"))
+        candidates.append({
+            "symbol": symbol,
+            "priceChangePercent": pct,
+            "quoteVolume": qv,
+            "lastPrice": last_price,
+            "highPrice": high_price,
+            "lowPrice": low_price,
+        })
 
     # 2. Futures filter
     if futures_symbols:
@@ -619,13 +760,41 @@ def get_opportunity_pairs(
         allowed_set = set(allowed_pairs)
         candidates = [c for c in candidates if c["symbol"] in allowed_set]
 
-    # 4. Sort theo abs(priceChangePercent) giảm dần
-    candidates.sort(key=lambda x: abs(x["priceChangePercent"]), reverse=True)
+    # 4. Tách LONG / SHORT candidates, filter "chưa ở đỉnh/đáy"
+    long_candidates = []
+    short_candidates = []
+    for c in candidates:
+        pct = c["priceChangePercent"]
+        last = c.get("lastPrice", 0)
+        high = c.get("highPrice", 0)
+        low = c.get("lowPrice", 0)
 
-    # 5. Cap
-    capped = [c["symbol"] for c in candidates[:max_pairs_per_scan]]
+        if pct >= 3.0:
+            # Đang tăng nhưng chưa ở đỉnh 24h (còn room)
+            if high > 0 and last < high * 0.95:
+                long_candidates.append(c)
+        elif pct <= -3.0:
+            # Đang giảm nhưng chưa ở đáy 24h (còn room short)
+            if low > 0 and last > low * 1.05:
+                short_candidates.append(c)
 
-    # 6. Add core_pairs ở đầu, dedupe, core không tính vào cap
+    # Sort riêng từng nhóm
+    long_candidates.sort(key=lambda x: x["priceChangePercent"], reverse=True)
+    short_candidates.sort(key=lambda x: x["priceChangePercent"])  # ascending (âm nhất lên đầu)
+
+    # Lấy đều 2 nhóm, fill shortage từ phía kia nếu một bên thiếu
+    half = max_pairs_per_scan // 2
+    long_picked = long_candidates[:half]
+    short_picked = short_candidates[:half]
+    shortage = half - len(long_picked)
+    if shortage > 0:
+        short_picked = short_candidates[: half + shortage]
+    shortage = half - len(short_picked)
+    if shortage > 0:
+        long_picked = long_candidates[: half + shortage]
+    capped = [c["symbol"] for c in long_picked] + [c["symbol"] for c in short_picked]
+
+    # 5. Add core_pairs ở đầu, dedupe, core không tính vào cap
     result = []
     seen = set()
     for p in core_pairs:
@@ -670,37 +839,59 @@ def calc_entry_sl_tp(
     regime: str,
     style: str = "swing",
     rr_ratio: float | None = None,
-) -> tuple[float, float, float]:
+    swing_low: float = 0.0,
+    swing_high: float = 0.0,
+) -> tuple[float, float, float] | None:
     """
     Rule-based entry/SL/TP.
     swing: ATR mult 1.5 (trending) / 1.2 (ranging), R:R 1:2
-    scalp: ATR mult 1.0 (trending) / 0.8 (ranging), R:R 1:1.5 (config), pullback entry
-    Returns (entry, sl, tp).
+    scalp: SL từ swing structure (tránh bị sweep), fallback ATR nếu structure quá xa
+    Returns (entry, sl, tp) hoặc None nếu setup không hợp lệ (scalp structure quá xa).
     """
     if style == "scalp":
-        # trending_volatile: mult 1.2 (wider SL to survive momentum)
-        if regime == "trending_volatile":
-            mult = 1.2
-        elif regime in ("trending_up", "trending_down"):
-            mult = 1.0
-        else:
-            mult = 0.8
-        rr = rr_ratio if rr_ratio and rr_ratio > 0 else 1.5  # scalp default 1:1.5
-        # Pullback entry: limit level chờ giá về (LONG -0.2*ATR, SHORT +0.2*ATR)
+        rr = rr_ratio if rr_ratio and rr_ratio > 0 else 1.5
         if direction == "LONG":
             entry = current_price - 0.2 * atr_value
+            # SL từ swing low thay vì ATR flat — tránh bị sweep
+            if swing_low > 0:
+                sl = swing_low - 0.1 * atr_value
+                if sl >= entry:
+                    logger.info("SL >= entry (swing_low quá cao) — structure invalid, reject")
+                    return None
+                if entry - sl > 2.0 * atr_value:
+                    logger.info(
+                        f"SL structure quá xa ({entry - sl:.2f} > 2×ATR {2 * atr_value:.2f}), reject"
+                    )
+                    return None  # Setup không có structure rõ, skip
+            else:
+                mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
+                sl = entry - mult * atr_value
         else:
             entry = current_price + 0.2 * atr_value
+            if swing_high > 0:
+                sl = swing_high + 0.1 * atr_value
+                if sl <= entry:
+                    logger.info("SL <= entry (swing_high quá thấp) — structure invalid, reject")
+                    return None
+                if sl - entry > 2.0 * atr_value:
+                    logger.info(
+                        f"SL structure quá xa ({sl - entry:.2f} > 2×ATR {2 * atr_value:.2f}), reject"
+                    )
+                    return None
+            else:
+                mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
+                sl = entry + mult * atr_value
+        tp = entry + rr * (entry - sl) if direction == "LONG" else entry - rr * (sl - entry)
     else:
         mult = 1.5 if regime in ("trending_up", "trending_down") else 1.2
         rr = rr_ratio if rr_ratio and rr_ratio > 0 else 2.0
         entry = current_price
-    if direction == "LONG":
-        sl = entry - mult * atr_value
-        tp = entry + rr * (entry - sl)
-    else:
-        sl = entry + mult * atr_value
-        tp = entry - rr * (sl - entry)
+        if direction == "LONG":
+            sl = entry - mult * atr_value
+            tp = entry + rr * (entry - sl)
+        else:
+            sl = entry + mult * atr_value
+            tp = entry - rr * (sl - entry)
     return entry, sl, tp
 
 

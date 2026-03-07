@@ -82,6 +82,8 @@ class ScanConfig:
     scalp_1h_range_min_pct: float = float(os.getenv("SCALP_1H_RANGE_MIN_PCT", "0.5"))
     # Scalp active hours UTC (ví dụ "8-16" = 8h-16h UTC). Để trống = 24/7
     scalp_active_hours_utc: str = os.getenv("SCALP_ACTIVE_HOURS_UTC", "").strip()
+    # Session filter: dead_zone skip, asia=core only, london+ny=all. SCALP_SESSION_FILTER=false để tắt
+    scalp_session_filter: bool = os.getenv("SCALP_SESSION_FILTER", "true").lower() == "true"
     # Whale data: scalp cần context ngắn (1h), swing 4h. Override: SCALP_WHALE_HOURS
     scalp_whale_hours: int = int(os.getenv("SCALP_WHALE_HOURS", "1"))
     # RELAX_FILTER=true: nới filter để test pipeline (net_score 5/-5, bỏ volume/momentum). Chỉ dùng khi test!
@@ -94,6 +96,8 @@ class ScanConfig:
             self.scan_interval_min = int(os.getenv("SCAN_INTERVAL_MIN", "5" if self.trading_style == "scalp" else "15"))
         if self.position_monitor_interval_min <= 0:
             self.position_monitor_interval_min = int(os.getenv("POSITION_MONITOR_INTERVAL_MIN", "1" if self.trading_style == "scalp" else "2"))
+        if self.max_pairs_per_scan <= 0:
+            self.max_pairs_per_scan = 15 if self.trading_style == "scalp" else 30
         if self.core_pairs is None:
             self.core_pairs = _parse_list_env("CORE_PAIRS", "BTCUSDT,ETHUSDT")
         if self.scan_blacklist is None:

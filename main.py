@@ -266,6 +266,38 @@ class TradingOrchestrator:
                 try:
                     current_price = await fetcher.get_current_price(t["pair"])
                     direction = Direction(t["direction"])
+                    entry = t["entry_price"]
+                    sl_state = t.get("sl_trailing_state") or "original"
+
+                    # Trail stop (scalp): move SL khi đang có lời
+                    if cfg.scan.trading_style == "scalp" and sl_state != "locked_50":
+                        target_pct = (
+                            (t["take_profit"] - entry) / entry * 100
+                            if direction == Direction.LONG
+                            else (entry - t["take_profit"]) / entry * 100
+                        )
+                        unrealized_pnl_pct = (
+                            (current_price - entry) / entry * 100
+                            if direction == Direction.LONG
+                            else (entry - current_price) / entry * 100
+                        )
+                        if target_pct > 0:
+                            current_sl = t["stop_loss"]
+                            if unrealized_pnl_pct >= target_pct * 0.8:
+                                new_sl = entry + (current_price - entry) * 0.5 if direction == Direction.LONG else entry - (entry - current_price) * 0.5
+                                # Chỉ trail lên (LONG) hoặc xuống (SHORT), không bao giờ overwrite với SL tệ hơn
+                                if (direction == Direction.LONG and new_sl > current_sl) or (direction == Direction.SHORT and new_sl < current_sl):
+                                    self.db.update_trade_sl(t["id"], new_sl, "locked_50")
+                                    t["stop_loss"] = new_sl
+                                    t["sl_trailing_state"] = "locked_50"
+                                    logger.info(f"Trail stop: {t['pair']} SL → lock 50% profit")
+                            elif unrealized_pnl_pct >= target_pct * 0.5 and sl_state == "original":
+                                new_sl = entry * 1.001 if direction == Direction.LONG else entry * 0.999
+                                if (direction == Direction.LONG and new_sl > current_sl) or (direction == Direction.SHORT and new_sl < current_sl):
+                                    self.db.update_trade_sl(t["id"], new_sl, "breakeven")
+                                    t["stop_loss"] = new_sl
+                                    t["sl_trailing_state"] = "breakeven"
+                                    logger.info(f"Trail stop: {t['pair']} SL → breakeven")
 
                     hit_sl = (direction == Direction.LONG and current_price <= t["stop_loss"]) or \
                              (direction == Direction.SHORT and current_price >= t["stop_loss"])
