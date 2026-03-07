@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trading Agent Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="layout">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <h1>Trading Agent</h1>
+      </div>
+      <div class="header-meta">
+        <span class="badge" id="mode-badge">PAPER</span>
+        <span class="last-update" id="last-update">—</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-label">Total PnL</span>
+          <span class="stat-value" id="total-pnl">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Daily PnL</span>
+          <span class="stat-value" id="daily-pnl">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Win Rate</span>
+          <span class="stat-value" id="win-rate">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Open Positions</span>
+          <span class="stat-value" id="open-positions">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Pending Signals</span>
+          <span class="stat-value" id="pending-signals">—</span>
+        </div>
+      </section>
+
+      <div class="panels">
+        <section class="panel">
+          <h2>Open Positions</h2>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Pair</th>
+                  <th>Direction</th>
+                  <th>Entry</th>
+                  <th>SL / TP</th>
+                  <th>Size</th>
+                </tr>
+              </thead>
+              <tbody id="open-trades-body">
+                <tr><td colspan="5" class="empty">No open positions</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Recent Signals</h2>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Pair</th>
+                  <th>Dir</th>
+                  <th>Conf</th>
+                  <th>Entry</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="signals-body">
+                <tr><td colspan="6" class="empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Trade History</h2>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Pair</th>
+                  <th>Dir</th>
+                  <th>Entry → Exit</th>
+                  <th>PnL</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="history-body">
+                <tr><td colspan="5" class="empty">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel panel-logs">
+          <h2>Agent Logs</h2>
+          <div class="logs-wrap" id="logs-body">
+            <div class="empty">Loading...</div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
