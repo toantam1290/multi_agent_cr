@@ -21,6 +21,7 @@ from utils.market_data import (
     get_opportunity_pairs,
     classify_regime, calc_entry_sl_tp,
 )
+from utils.smc import SMCAnalyzer, SMCSignal
 from database import Database
 
 # Estimated cost per Claude call (Sonnet) for budget tracking
@@ -76,6 +77,7 @@ class ResearchAgent:
         self.binance = BinanceDataFetcher()
         self.whale = WhaleDataFetcher()
         self.fear_greed = FearGreedFetcher()
+        self.smc = SMCAnalyzer(self.binance)
         self._claude_semaphore = asyncio.Semaphore(2)  # Tối đa 2 Claude calls song song (tránh budget race)
         self._pair_semaphore = asyncio.Semaphore(5)  # Tối đa 5 pairs phân tích đồng thời (tránh Binance throttle)
         logger.info("ResearchAgent initialized")
@@ -271,6 +273,26 @@ class ResearchAgent:
                     self.db.log("research_agent", "INFO", f"Skip {pair}: timing", {"pair": pair})
                     return None, meta
 
+            # 2d. SMC analysis — context cho Claude, cộng confluence nếu valid
+            smc_signal = await self.smc.analyze(pair, style=style)
+
+            # 2e. SMC opposing hard-reject — SMC mạnh ngược chiều direction → skip
+            if not relax and smc_signal.smc_valid:
+                smc_opposing = (
+                    (direction == "LONG" and smc_signal.smc_score <= -50)
+                    or (direction == "SHORT" and smc_signal.smc_score >= 50)
+                )
+                if smc_opposing:
+                    logger.info(
+                        f"{pair}: SMC opposing — score={smc_signal.smc_score} "
+                        f"bias={smc_signal.bias} vs direction={direction}, skip"
+                    )
+                    self.db.log(
+                        "research_agent", "INFO", f"Skip {pair}: SMC opposing",
+                        {"pair": pair, "smc_score": smc_signal.smc_score, "direction": direction},
+                    )
+                    return None, meta
+
             # 3. Regime (ADX + BB + ATR) — dùng bb_width_regime, atr_ratio_regime (scalp = 1h nhất quán)
             regime = classify_regime(
                 technical.adx, technical.plus_di, technical.minus_di,
@@ -333,6 +355,17 @@ class ResearchAgent:
                 confluence_score += 1
             if direction == "SHORT" and 0 <= technical.vwap_distance_pct <= 0.5:
                 confluence_score += 1
+            # SMC context — cần có OB / FVG / sweep (bias một mình không đủ)
+            _smc_has_precision = (
+                smc_signal.price_in_ob
+                or smc_signal.price_in_fvg
+                or smc_signal.sweep_direction != "none"
+            )
+            if smc_signal.smc_valid and _smc_has_precision:
+                if direction == "LONG" and smc_signal.smc_score >= 50:
+                    confluence_score += 2
+                elif direction == "SHORT" and smc_signal.smc_score <= -50:
+                    confluence_score += 2
             if not relax and confluence_score < min_confluence:
                 meta["confluence_rejected"] = True
                 logger.info(f"{pair}: Confluence {confluence_score}/9 < {min_confluence}, skip Claude")
@@ -363,6 +396,34 @@ class ResearchAgent:
                 return None, meta
             entry, sl, tp = result
 
+            # 5b. SMC OB entry override — entry gần market, SL dưới/trên OB boundary
+            if smc_signal.price_in_ob and smc_signal.smc_valid:
+                rr = cfg.trading.scalp_risk_reward_ratio if style == "scalp" else 1.5
+                if direction == "LONG" and smc_signal.nearest_bullish_ob:
+                    ob = smc_signal.nearest_bullish_ob
+                    ob_entry = current_price - 0.1 * technical.atr_value  # pullback nhỏ, gần market
+                    ob_sl = ob.price_low - 0.1 * technical.atr_value  # SL dưới OB
+                    if ob_sl < ob_entry and (ob_entry - ob_sl) <= 2.0 * technical.atr_value:
+                        ob_tp = ob_entry + rr * (ob_entry - ob_sl)
+                        entry, sl, tp = ob_entry, ob_sl, ob_tp
+                        logger.info(
+                            f"{pair}: SMC OB entry override LONG "
+                            f"entry={entry:.2f} sl={sl:.2f} tp={tp:.2f} "
+                            f"OB=[{ob.price_low:.2f}-{ob.price_high:.2f}]"
+                        )
+                elif direction == "SHORT" and smc_signal.nearest_bearish_ob:
+                    ob = smc_signal.nearest_bearish_ob
+                    ob_entry = current_price + 0.1 * technical.atr_value  # pullback nhỏ, gần market
+                    ob_sl = ob.price_high + 0.1 * technical.atr_value  # SL trên OB
+                    if ob_sl > ob_entry and (ob_sl - ob_entry) <= 2.0 * technical.atr_value:
+                        ob_tp = ob_entry - rr * (ob_sl - ob_entry)
+                        entry, sl, tp = ob_entry, ob_sl, ob_tp
+                        logger.info(
+                            f"{pair}: SMC OB entry override SHORT "
+                            f"entry={entry:.2f} sl={sl:.2f} tp={tp:.2f} "
+                            f"OB=[{ob.price_low:.2f}-{ob.price_high:.2f}]"
+                        )
+
             # 6. Claude risk assessment (pre-mortem)
             analysis = await self._claude_analyze(
                 pair, current_price, technical, whale_data, sentiment, derivatives,
@@ -372,6 +433,7 @@ class ResearchAgent:
                 cvd=cvd,
                 ob_imbalance=ob_imbalance,
                 session=session if style == "scalp" else None,
+                smc_signal=smc_signal,
             )
 
             if not analysis or not analysis.get("should_trade"):
@@ -403,6 +465,14 @@ class ResearchAgent:
 
             rr = reward / risk if risk > 0 else 0
 
+            smc_dict: Optional[dict] = None
+            if smc_signal.smc_valid:
+                smc_dict = {
+                    "summary": smc_signal.summary,
+                    "bias": smc_signal.bias,
+                    "smc_score": smc_signal.smc_score,
+                    "last_structure_event": smc_signal.last_structure_event,
+                }
             signal = TradingSignal(
                 id=str(uuid.uuid4()),
                 pair=pair,
@@ -420,6 +490,7 @@ class ResearchAgent:
                 status=SignalStatus.PENDING,
                 regime=regime,
                 model_version="claude-sonnet-4-6",
+                smc=smc_dict,
             )
 
             self.db.save_signal(signal)
@@ -459,6 +530,7 @@ class ResearchAgent:
         cvd: dict | None = None,
         ob_imbalance: float = 1.0,
         session: str | None = None,
+        smc_signal: Optional[SMCSignal] = None,
     ) -> Optional[dict]:
         """Claude pre-mortem risk assessment. Entry/SL/TP đã tính sẵn (rule-based)."""
 
@@ -509,6 +581,7 @@ DATA:
 - Spread: {spread_pct:.3f}% | OI change 24h: {derivatives.oi_change_pct:+.1f}%
 - CVD ratio: {(cvd or {}).get('cvd_ratio', 0.5):.2f} | CVD trend: {(cvd or {}).get('cvd_trend', 'neutral')}
 - Orderbook imbalance: {ob_imbalance:.2f} | VWAP distance: {technical.vwap_distance_pct:+.1f}%
+- SMC: {smc_signal.summary if smc_signal and smc_signal.smc_valid else "No clear SMC structure detected"}
 {f'- Session: {session}' if session else ''}
 
 1. Top 3 risks invalidate trade?

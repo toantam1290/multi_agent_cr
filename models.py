@@ -141,6 +141,9 @@ class TradingSignal(BaseModel):
     regime: Optional[str] = None       # trending_up | trending_down | ranging | volatile
     model_version: Optional[str] = None
 
+    # SMC context (Smart Money Concepts) — snapshot serialized để lưu DB
+    smc: Optional[dict] = None
+
     @property
     def risk_pct(self) -> float:
         """% rủi ro từ entry đến stop-loss"""

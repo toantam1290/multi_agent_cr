@@ -78,6 +78,7 @@ class BacktestConfig:
     use_session_filter: bool = True
     use_regime_filter: bool = True
     use_chop_filter: bool = True       # Chop Index > 61.8 → skip (scalp)
+    use_smc_filter: bool = True        # SMC opposing + confluence + OB override
     use_correlation_filter: bool = True # Tối đa 2 vị thế cùng hướng
     use_dynamic_confluence: bool = True # Win rate < 45% → min_confluence=4
     use_sl_structure: bool = True
@@ -642,7 +643,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     rsi_long_max = 78.0   # Hard ceiling tránh overbought extreme
     rsi_long_min = 45.0   # Nới xuống 45 cho sideways + uptrend
     rsi_short_min = 22.0  # Hard floor tránh oversold extreme
-    rsi_short_max = 55.0  # Nới lên 55 cho sideways + downtrend
+    rsi_short_max = 62.0 if ind["trend_1d"] == "sideways" else 55.0  # Sideways: 58–62 = overbought cục bộ → SHORT
     if style != "scalp":
         rsi_long_max = config.scalp_rsi_long_max
         rsi_long_min = 35.0
@@ -714,10 +715,10 @@ def calc_confluence(ind: dict, direction: str, funding_rate: float, oi_change_pc
         score += 1
     if direction == "SHORT" and funding_rate > 0.0002:
         score += 1
-    # CVD: tối đa 1 điểm (gộp ratio + trend để tránh CVD chiếm 3/5 confluence)
+    # CVD: tối đa 1 điểm. SHORT: ratio HOẶC trend (cả hai cùng lúc quá hiếm)
     cvd_ok = (
         (direction == "LONG" and ind["cvd_ratio"] > 0.5 and ind["cvd_trend"] == "accelerating_buy")
-        or (direction == "SHORT" and ind["cvd_ratio"] < 0.5 and ind["cvd_trend"] == "accelerating_sell")
+        or (direction == "SHORT" and (ind["cvd_ratio"] < 0.45 or ind["cvd_trend"] == "accelerating_sell"))
     )
     if cvd_ok:
         score += 1
@@ -947,13 +948,18 @@ def run_backtest_for_symbol(
     # Filter funnel diagnostic
     funnel = {
         "total": 0, "session": 0, "rule": 0, "cvd": 0, "vwap": 0,
-        "ema9": 0, "regime": 0, "chop": 0, "correlation": 0,
+        "ema9": 0, "regime": 0, "chop": 0, "smc": 0, "correlation": 0,
         "confluence": 0, "no_future": 0, "calc_sl_tp": 0, "traded": 0,
     }
 
     WARMUP_CANDLES = {
         "5m": 200, "15m": 200, "1h": 200, "4h": 100, "1d": 400
     }
+
+    _smc_analyzer = None
+    if config.use_smc_filter and style == "scalp":
+        from utils.smc import SMCAnalyzer
+        _smc_analyzer = SMCAnalyzer(None)
 
     total_steps = len(df_step_bt)
     report_every = max(1, total_steps // 20)
@@ -1060,6 +1066,25 @@ def run_backtest_for_symbol(
             funnel["chop"] += 1
             continue
 
+        # ── SMC analysis (mirrors production, scalp only) ──────────────────
+        smc_signal = None
+        if _smc_analyzer is not None:
+            df_structure = get_window("15m", 100)
+            df_timing = get_window("5m", 50)
+            if len(df_structure) >= 30 and len(df_timing) >= 10:
+                smc_signal = _smc_analyzer.analyze_from_dataframes(
+                    df_structure, df_timing, current_price
+                )
+                # SMC opposing hard-reject
+                if smc_signal.smc_valid:
+                    smc_opposing = (
+                        (direction == "LONG" and smc_signal.smc_score <= -50)
+                        or (direction == "SHORT" and smc_signal.smc_score >= 50)
+                    )
+                    if smc_opposing:
+                        funnel["smc"] += 1
+                        continue
+
         # ── Correlation filter: tối đa 2 vị thế cùng hướng ──────────────────
         if config.use_correlation_filter:
             open_now = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
@@ -1079,6 +1104,18 @@ def run_backtest_for_symbol(
 
         # ── Confluence check ───────────────────────────────────────────────
         confluence_score = calc_confluence(ind, direction, funding_rate, oi_change_pct)
+        # SMC confluence (mirrors production: _smc_has_precision + score >= 50)
+        if config.use_smc_filter and style == "scalp" and smc_signal is not None:
+            _smc_has_precision = (
+                smc_signal.price_in_ob
+                or smc_signal.price_in_fvg
+                or smc_signal.sweep_direction != "none"
+            )
+            if smc_signal.smc_valid and _smc_has_precision:
+                if direction == "LONG" and smc_signal.smc_score >= 50:
+                    confluence_score += 2
+                elif direction == "SHORT" and smc_signal.smc_score <= -50:
+                    confluence_score += 2
         if config.use_confluence_filter and confluence_score < effective_confluence:
             funnel["confluence"] += 1
             continue
@@ -1103,6 +1140,25 @@ def run_backtest_for_symbol(
             funnel["calc_sl_tp"] += 1
             continue
         entry, sl, tp = result
+
+        # ── SMC OB entry override (mirrors production 5b) ─────────────────────
+        if config.use_smc_filter and style == "scalp" and smc_signal is not None:
+            if smc_signal.price_in_ob and smc_signal.smc_valid:
+                atr_val = ind["atr_value"]
+                if direction == "LONG" and smc_signal.nearest_bullish_ob:
+                    ob = smc_signal.nearest_bullish_ob
+                    ob_entry = current_price - 0.1 * atr_val
+                    ob_sl = ob.price_low - 0.1 * atr_val
+                    if ob_sl < ob_entry and (ob_entry - ob_sl) <= 2.0 * atr_val:
+                        ob_tp = ob_entry + rr * (ob_entry - ob_sl)
+                        entry, sl, tp = ob_entry, ob_sl, ob_tp
+                elif direction == "SHORT" and smc_signal.nearest_bearish_ob:
+                    ob = smc_signal.nearest_bearish_ob
+                    ob_entry = current_price + 0.1 * atr_val
+                    ob_sl = ob.price_high + 0.1 * atr_val
+                    if ob_sl > ob_entry and (ob_sl - ob_entry) <= 2.0 * atr_val:
+                        ob_tp = ob_entry - rr * (ob_sl - ob_entry)
+                        entry, sl, tp = ob_entry, ob_sl, ob_tp
 
         # ── Simulate outcome ───────────────────────────────────────────────
         future_mask = df_future.index > step_ts
@@ -1164,6 +1220,7 @@ def run_backtest_for_symbol(
             ("EMA9 timing",     "ema9"),
             ("volatile regime", "regime"),
             ("chop > 61.8",     "chop"),
+            ("SMC opposing",     "smc"),
             ("correlation",     "correlation"),
             ("confluence < N",  "confluence"),
             ("calc SL/TP fail", "calc_sl_tp"),
@@ -1264,6 +1321,10 @@ def run_backtest_combined(
         return []
 
     WARMUP_CANDLES = {"5m": 200, "15m": 200, "1h": 200, "4h": 100, "1d": 400}
+    _smc_analyzer = None
+    if config.use_smc_filter and style == "scalp":
+        from utils.smc import SMCAnalyzer
+        _smc_analyzer = SMCAnalyzer(None)
     trades = []
     open_positions = []
     total_steps = len(df_step_bt)
@@ -1338,6 +1399,22 @@ def run_backtest_combined(
             if config.use_chop_filter and style == "scalp" and ind["chop_index"] > CHOP_SKIP_THRESHOLD:
                 continue
 
+            smc_signal = None
+            if _smc_analyzer is not None:
+                df_structure = get_window("15m", 100)
+                df_timing = get_window("5m", 50)
+                if len(df_structure) >= 30 and len(df_timing) >= 10:
+                    smc_signal = _smc_analyzer.analyze_from_dataframes(
+                        df_structure, df_timing, ind["current_price"]
+                    )
+                    if smc_signal.smc_valid:
+                        smc_opposing = (
+                            (direction == "LONG" and smc_signal.smc_score <= -50)
+                            or (direction == "SHORT" and smc_signal.smc_score >= 50)
+                        )
+                        if smc_opposing:
+                            continue
+
             if config.use_correlation_filter:
                 open_now = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
                 same_dir = sum(1 for p in open_now if p.direction == direction)
@@ -1352,6 +1429,17 @@ def run_backtest_combined(
                     effective_confluence = 4
 
             confluence_score = calc_confluence(ind, direction, funding_rate, oi_change_pct)
+            if config.use_smc_filter and style == "scalp" and smc_signal is not None:
+                _smc_has_precision = (
+                    smc_signal.price_in_ob
+                    or smc_signal.price_in_fvg
+                    or smc_signal.sweep_direction != "none"
+                )
+                if smc_signal.smc_valid and _smc_has_precision:
+                    if direction == "LONG" and smc_signal.smc_score >= 50:
+                        confluence_score += 2
+                    elif direction == "SHORT" and smc_signal.smc_score <= -50:
+                        confluence_score += 2
             if config.use_confluence_filter and confluence_score < effective_confluence:
                 continue
 
@@ -1367,6 +1455,24 @@ def run_backtest_combined(
             if result is None:
                 continue
             entry, sl, tp = result
+
+            if config.use_smc_filter and style == "scalp" and smc_signal is not None:
+                if smc_signal.price_in_ob and smc_signal.smc_valid:
+                    atr_val = ind["atr_value"]
+                    if direction == "LONG" and smc_signal.nearest_bullish_ob:
+                        ob = smc_signal.nearest_bullish_ob
+                        ob_entry = ind["current_price"] - 0.1 * atr_val
+                        ob_sl = ob.price_low - 0.1 * atr_val
+                        if ob_sl < ob_entry and (ob_entry - ob_sl) <= 2.0 * atr_val:
+                            ob_tp = ob_entry + rr * (ob_entry - ob_sl)
+                            entry, sl, tp = ob_entry, ob_sl, ob_tp
+                    elif direction == "SHORT" and smc_signal.nearest_bearish_ob:
+                        ob = smc_signal.nearest_bearish_ob
+                        ob_entry = ind["current_price"] + 0.1 * atr_val
+                        ob_sl = ob.price_high + 0.1 * atr_val
+                        if ob_sl > ob_entry and (ob_sl - ob_entry) <= 2.0 * atr_val:
+                            ob_tp = ob_entry - rr * (ob_sl - ob_entry)
+                            entry, sl, tp = ob_entry, ob_sl, ob_tp
 
             future_mask = df_future.index > step_ts
             future_candles = df_future[future_mask].iloc[: max_hold * 2]
@@ -1658,6 +1764,7 @@ Examples:
     parser.add_argument("--no-session", action="store_true", help="Disable session filter")
     parser.add_argument("--no-regime", action="store_true", help="Disable regime filter")
     parser.add_argument("--no-chop", action="store_true", help="Disable Chop Index filter")
+    parser.add_argument("--no-smc", action="store_true", help="Disable SMC filter (opposing + confluence + OB override)")
     parser.add_argument("--no-correlation", action="store_true", help="Disable correlation filter (max 2 same dir)")
     parser.add_argument("--no-dynamic-confluence", action="store_true", help="Disable dynamic confluence (win rate < 45%% -> 4)")
     parser.add_argument("--no-sl-structure", action="store_true", help="Use ATR SL instead of swing structure")
@@ -1667,6 +1774,7 @@ Examples:
     # Params
     parser.add_argument("--confluence", type=int, default=3, help="Confluence threshold (default 3)")
     parser.add_argument("--rr", type=float, default=2.0, help="Risk:Reward ratio")
+    parser.add_argument("--scalp-rr", type=float, default=None, help="Override RR for scalp only (e.g. 1.3 để giảm TIME_EXIT)")
     parser.add_argument("--net-score", dest="net_score", type=int, default=0,
                         help="Net score threshold LONG (0=auto: scalp=20, swing=10)")
     parser.add_argument("--strategy", default="", choices=["", "v1", "v2", "loose"],
@@ -1710,7 +1818,7 @@ Examples:
         if args.net_score == 0:
             args.net_score = 3
         if args.confluence == 3:
-            args.confluence = 1
+            args.confluence = 2 if args.style == "swing" else 1
 
     symbols = [s.strip().upper() for s in args.symbol.split(",")]
 
@@ -1727,6 +1835,7 @@ Examples:
         use_session_filter=not args.no_session,
         use_regime_filter=not args.no_regime,
         use_chop_filter=not args.no_chop,
+        use_smc_filter=not args.no_smc,
         use_correlation_filter=not args.no_correlation,
         use_dynamic_confluence=not args.no_dynamic_confluence,
         use_sl_structure=not args.no_sl_structure,
@@ -1735,7 +1844,7 @@ Examples:
         net_score_min=args.net_score,
         rule_case=args.rule_case,
         confluence_threshold=args.confluence,
-        scalp_rr=args.rr,
+        scalp_rr=args.scalp_rr if args.scalp_rr is not None else args.rr,
         swing_rr=args.rr if args.style == "swing" else SWING_RR,
         walk_forward=args.walk_forward,
         wf_train_days=args.wf_train,
@@ -1748,7 +1857,7 @@ Examples:
     print(f"   Filters : rule={config.use_rule_filter} ema9={config.use_ema9_filter} "
           f"conf={config.use_confluence_filter}(>={config.confluence_threshold}) "
           f"cvd={config.use_cvd_proxy} vwap={config.use_vwap_filter} "
-          f"session={config.use_session_filter} chop={config.use_chop_filter} "
+          f"session={config.use_session_filter} chop={config.use_chop_filter} smc={config.use_smc_filter} "
           f"corr={config.use_correlation_filter} dyn_conf={config.use_dynamic_confluence}")
     print(f"   Params  : RR={config.scalp_rr} trail={config.use_trail_stop} sl_structure={config.use_sl_structure}")
     print(f"   Rule    : {config.rule_case}")
