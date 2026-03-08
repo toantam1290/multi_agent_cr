@@ -1,0 +1,52 @@
+Backtest Full Report - 2026-03-08 11:44
+Symbols: BTCUSDT | Period: 90 days | Cache: True
+==========================================================================================
+
+## Step 2: Filter Funnel Diagnosis
+
+    Filter Funnel [BTCUSDT] (5761 candles scanned):
+      -> dead_zone skip        :   960 (16.7%)
+      -> rule filter           :  4770 (82.8%)
+      -> CVD proxy             :    12 (0.2%)
+      -> EMA9 timing           :    17 (0.3%)
+      -> confluence < N        :     1 (0.0%)
+      -> calc SL/TP fail       :     1 (0.0%)
+      OK Traded              :     0 (0.00%)
+
+## Step 3: Strategy Comparison (loose vs v2)
+
+  LOOSE   : trades=  45 | win= 17.8% | PF=0.13 | maxDD=0.1% | PnL=-0.14% | CHECK
+  V2      : trades=  24 | win= 25.0% | PF=0.19 | maxDD=0.1% | PnL=-0.06% | CHECK
+
+  Target v2: >=100 trades, PF>=1.2, Win%>=52%
+
+## Step 5: Walk-Forward Validation
+
+  Train=90d, Test=30d
+  Window                               IS Win%   IS#  OOS Win%  OOS#   OOS PnL  OOS DD
+  -------------------------------------------------------------------------------------
+
+  OOS profitable: 0/0 windows
+  Target: at least 2/3 OOS windows profitable
+
+## Step 7: LONG vs SHORT (rule cases)
+
+  Rule Case       Trades   Win%     PF     PnL%
+  --------------------------------------------------
+  full                24  25.0%   0.19   -0.06%
+  long_only           23  26.1%   0.19   -0.06%
+  short_only           6  16.7%   0.49   -0.01%
+  no_volume           44  13.6%   0.09   -0.15%
+  no_momentum         24  25.0%   0.19   -0.06%
+
+==========================================================================================
+## Metrics Target (before live)
+  | Metric          | Minimum | Target  |
+  |-----------------|---------|---------|
+  | Trades          | >= 100  | >= 200  |
+  | Win Rate        | >= 50%  | >= 55%  |
+  | Profit Factor   | >= 1.1  | >= 1.3  |
+  | Max Drawdown    | < 5%    | < 3%    |
+  | Sharpe Ratio    | > 0.8   | > 1.2   |
+  | OOS consistency | 2/3 win | 3/3 win |
+==========================================================================================

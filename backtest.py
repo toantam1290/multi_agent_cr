@@ -82,6 +82,11 @@ class BacktestConfig:
     use_dynamic_confluence: bool = True # Win rate < 45% → min_confluence=4
     use_sl_structure: bool = True
     use_trail_stop: bool = True
+    # Momentum gate: True = hard gate (phải có momentum mới pass),
+    # False = momentum chỉ là bonus +15 vào net_score
+    use_momentum_gate: bool = True
+    # Net score threshold override (0 = auto: scalp=20, swing=10)
+    net_score_min: int = 0
     # Tunable parameters
     confluence_threshold: int = 3
     scalp_rr: float = SCALP_RR
@@ -626,6 +631,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     rsi_long_max = config.scalp_rsi_long_max if style == "scalp" else 45.0
     rsi_short_min = config.scalp_rsi_short_min if style == "scalp" else 55.0
     rule_case = getattr(config, "rule_case", "full")
+    use_momentum_gate = getattr(config, "use_momentum_gate", True)
 
     # Volume check (scalp) — skip nếu no_volume
     if style == "scalp" and rule_case != "no_volume":
@@ -633,8 +639,14 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
         if not vol_ok:
             return None
 
-    net_long_min = 20 if style == "scalp" else 10
-    net_short_max = -20 if style == "scalp" else -10
+    # Net score threshold: dùng config nếu set, không thì auto theo style
+    cfg_min = getattr(config, "net_score_min", 0)
+    if cfg_min > 0:
+        net_long_min = cfg_min
+        net_short_max = -cfg_min
+    else:
+        net_long_min = 20 if style == "scalp" else 10
+        net_short_max = -20 if style == "scalp" else -10
 
     # LONG
     if rule_case != "short_only":
@@ -645,8 +657,10 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
             and ind["net_score"] > net_long_min
         )
         if long_ok:
-            if style == "scalp" and rule_case != "no_momentum" and not ind["momentum_bullish"]:
-                pass  # Không return LONG
+            # Khi use_momentum_gate=False: momentum là bonus trong net_score, không gate cứng
+            if style == "scalp" and use_momentum_gate and rule_case not in ("no_momentum",):
+                if ind["momentum_bullish"]:
+                    return "LONG"
             else:
                 return "LONG"
 
@@ -659,8 +673,9 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
             and ind["net_score"] < net_short_max
         )
         if short_ok:
-            if style == "scalp" and rule_case != "no_momentum" and not ind["momentum_bearish"]:
-                pass
+            if style == "scalp" and use_momentum_gate and rule_case not in ("no_momentum",):
+                if ind["momentum_bearish"]:
+                    return "SHORT"
             else:
                 return "SHORT"
 
@@ -933,6 +948,13 @@ def run_backtest_for_symbol(
     trades = []
     open_positions = []  # Track open positions for max_positions check
 
+    # Filter funnel diagnostic
+    funnel = {
+        "total": 0, "session": 0, "rule": 0, "cvd": 0, "vwap": 0,
+        "ema9": 0, "regime": 0, "chop": 0, "correlation": 0,
+        "confluence": 0, "no_future": 0, "calc_sl_tp": 0, "traded": 0,
+    }
+
     WARMUP_CANDLES = {
         "5m": 200, "15m": 200, "1h": 200, "4h": 100, "1d": 400
     }
@@ -978,8 +1000,10 @@ def run_backtest_for_symbol(
 
         # ── Session filter ─────────────────────────────────────────────────
         session = get_session(step_ts)
+        funnel["total"] += 1
         if config.use_session_filter and style == "scalp":
             if session == "dead_zone":
+                funnel["session"] += 1
                 continue
 
         # ── Funding rate ───────────────────────────────────────────────────
@@ -990,26 +1014,32 @@ def run_backtest_for_symbol(
         if config.use_rule_filter:
             direction = rule_based_filter(ind, funding_rate, config)
             if direction is None:
+                funnel["rule"] += 1
                 continue
         else:
             # Không filter: chỉ dùng net_score để determine direction
             direction = "LONG" if ind["net_score"] > 0 else ("SHORT" if ind["net_score"] < 0 else None)
             if direction is None:
+                funnel["rule"] += 1
                 continue
 
         # ── CVD divergence check ───────────────────────────────────────────
         if config.use_cvd_proxy and style == "scalp":
             if direction == "LONG" and ind["cvd_ratio"] < 0.45:
+                funnel["cvd"] += 1
                 continue
             if direction == "SHORT" and ind["cvd_ratio"] > 0.55:
+                funnel["cvd"] += 1
                 continue
 
         # ── VWAP bias filter ───────────────────────────────────────────────
         if config.use_vwap_filter and style == "scalp":
             vd = ind["vwap_distance_pct"]
             if direction == "LONG" and vd > 1.5:
+                funnel["vwap"] += 1
                 continue
             if direction == "SHORT" and vd < -1.5:
+                funnel["vwap"] += 1
                 continue
 
         # ── EMA9 timing filter ─────────────────────────────────────────────
@@ -1017,6 +1047,7 @@ def run_backtest_for_symbol(
             timing_ok = (direction == "LONG" and ind["ema9_crossed_recent_up"]) or \
                         (direction == "SHORT" and ind["ema9_crossed_recent_down"])
             if not timing_ok:
+                funnel["ema9"] += 1
                 continue
 
         # ── Regime check ───────────────────────────────────────────────────
@@ -1025,10 +1056,12 @@ def run_backtest_for_symbol(
             ind["bb_width_regime"], ind["atr_ratio_regime"]
         )
         if config.use_regime_filter and style == "scalp" and regime == "volatile":
+            funnel["regime"] += 1
             continue
 
         # ── Chop Index filter (scalp: > 61.8 = choppy) ─────────────────────
         if config.use_chop_filter and style == "scalp" and ind["chop_index"] > CHOP_SKIP_THRESHOLD:
+            funnel["chop"] += 1
             continue
 
         # ── Correlation filter: tối đa 2 vị thế cùng hướng ──────────────────
@@ -1036,6 +1069,7 @@ def run_backtest_for_symbol(
             open_now = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
             same_dir = sum(1 for p in open_now if p.direction == direction)
             if same_dir >= MAX_SAME_DIRECTION:
+                funnel["correlation"] += 1
                 continue
 
         # ── Dynamic confluence: win rate < 45% → thắt chặt ──────────────────
@@ -1050,6 +1084,7 @@ def run_backtest_for_symbol(
         # ── Confluence check ───────────────────────────────────────────────
         confluence_score = calc_confluence(ind, direction, funding_rate, oi_change_pct)
         if config.use_confluence_filter and confluence_score < effective_confluence:
+            funnel["confluence"] += 1
             continue
 
         # ── Duplicate pair check ───────────────────────────────────────────
@@ -1069,6 +1104,7 @@ def run_backtest_for_symbol(
             direction, current_price, ind["atr_value"], regime, style, rr, **sl_args
         )
         if result is None:
+            funnel["calc_sl_tp"] += 1
             continue
         entry, sl, tp = result
 
@@ -1077,7 +1113,10 @@ def run_backtest_for_symbol(
         future_candles = df_future[future_mask].iloc[:max_hold * 2]  # Buffer
 
         if len(future_candles) < 3:
+            funnel["no_future"] += 1
             continue
+
+        funnel["traded"] += 1
 
         outcome, exit_price, pnl_pct, hold_candles, sl_state = simulate_trade(
             direction, entry, sl, tp, future_candles,
@@ -1116,6 +1155,28 @@ def run_backtest_for_symbol(
 
     if verbose:
         print()
+
+    # In filter funnel nếu verbose
+    total = funnel["total"]
+    if verbose and total > 0:
+        print(f"\n  Filter Funnel [{symbol}] ({total} candles scanned):")
+        for label, key in [
+            ("dead_zone skip",  "session"),
+            ("rule filter",     "rule"),
+            ("CVD proxy",       "cvd"),
+            ("VWAP bias",       "vwap"),
+            ("EMA9 timing",     "ema9"),
+            ("volatile regime", "regime"),
+            ("chop > 61.8",     "chop"),
+            ("correlation",     "correlation"),
+            ("confluence < N",  "confluence"),
+            ("calc SL/TP fail", "calc_sl_tp"),
+            ("no future data",  "no_future"),
+        ]:
+            count = funnel[key]
+            if count > 0:
+                print(f"    -> {label:<22}: {count:5d} ({count/total*100:.1f}%)")
+        print(f"    OK Traded              : {funnel['traded']:5d} ({funnel['traded']/total*100:.2f}%)")
 
     return trades
 
@@ -1602,12 +1663,20 @@ Examples:
     parser.add_argument("--no-regime", action="store_true", help="Disable regime filter")
     parser.add_argument("--no-chop", action="store_true", help="Disable Chop Index filter")
     parser.add_argument("--no-correlation", action="store_true", help="Disable correlation filter (max 2 same dir)")
-    parser.add_argument("--no-dynamic-confluence", action="store_true", help="Disable dynamic confluence (win rate < 45% → 4)")
+    parser.add_argument("--no-dynamic-confluence", action="store_true", help="Disable dynamic confluence (win rate < 45%% -> 4)")
     parser.add_argument("--no-sl-structure", action="store_true", help="Use ATR SL instead of swing structure")
     parser.add_argument("--no-trail", action="store_true", help="Disable trail stop")
+    parser.add_argument("--no-momentum-gate", dest="no_momentum_gate", action="store_true",
+                        help="Momentum thanh bonus (+15 net_score) thay vi hard gate")
     # Params
     parser.add_argument("--confluence", type=int, default=3, help="Confluence threshold (default 3)")
     parser.add_argument("--rr", type=float, default=1.5, help="Risk:Reward ratio")
+    parser.add_argument("--net-score", dest="net_score", type=int, default=0,
+                        help="Net score threshold LONG (0=auto: scalp=20, swing=10)")
+    parser.add_argument("--strategy", default="", choices=["", "v1", "v2", "loose"],
+                        help="Preset: v1=default, v2=no-ema9+no-momentum-gate+net10+conf2, loose=minimal")
+    parser.add_argument("--funnel", action="store_true",
+                        help="In filter funnel: bao nhieu signal bi kill boi tung filter")
     parser.add_argument("--verbose", action="store_true")
     # Data cache
     parser.add_argument("--download-only", action="store_true", help="Chỉ download data và lưu cache, không chạy backtest")
@@ -1630,6 +1699,23 @@ Examples:
     else:
         date_to = now
 
+    # Apply strategy presets
+    if args.strategy == "v2":
+        args.no_ema9 = True
+        args.no_momentum_gate = True
+        if args.net_score == 0:
+            args.net_score = 10
+        if args.confluence == 3:
+            args.confluence = 2
+    elif args.strategy == "loose":
+        args.no_ema9 = True
+        args.no_cvd = True
+        args.no_momentum_gate = True
+        if args.net_score == 0:
+            args.net_score = 5
+        if args.confluence == 3:
+            args.confluence = 1
+
     symbols = [s.strip().upper() for s in args.symbol.split(",")]
 
     config = BacktestConfig(
@@ -1649,6 +1735,8 @@ Examples:
         use_dynamic_confluence=not args.no_dynamic_confluence,
         use_sl_structure=not args.no_sl_structure,
         use_trail_stop=not args.no_trail,
+        use_momentum_gate=not args.no_momentum_gate,
+        net_score_min=args.net_score,
         rule_case=args.rule_case,
         confluence_threshold=args.confluence,
         scalp_rr=args.rr,
@@ -1730,7 +1818,7 @@ Examples:
             all_trades = run_backtest_combined(
                 symbols, all_data, config,
                 date_from, date_to,
-                verbose=args.verbose or True,
+                verbose=args.verbose or args.funnel,
             )
             print(f"   → {len(all_trades)} trades generated")
         else:
@@ -1740,7 +1828,7 @@ Examples:
                 trades = run_backtest_for_symbol(
                     symbol, all_data[symbol], config,
                     date_from, date_to,
-                    verbose=args.verbose or True,
+                    verbose=args.verbose or args.funnel,
                 )
                 all_trades.extend(trades)
                 print(f"   → {len(trades)} trades generated")
