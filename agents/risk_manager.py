@@ -10,6 +10,7 @@ from database import Database
 class RiskRejectionReason:
     DAILY_LOSS_EXCEEDED = "Daily loss limit exceeded"
     TOO_MANY_POSITIONS = "Too many open positions"
+    CORRELATION_RISK = "Correlation risk: too many same-direction positions"
     LOW_CONFIDENCE = "Confidence below minimum threshold"
     LOW_RISK_REWARD = "Risk:Reward ratio too low"
     DUPLICATE_PAIR = "Already have open position on this pair"
@@ -36,6 +37,7 @@ class RiskManagerAgent:
         checks = [
             self._check_daily_loss(portfolio),
             self._check_open_positions(portfolio),
+            self._check_correlation(signal, portfolio),
             self._check_confidence(signal),
             self._check_risk_reward(signal),
             self._check_duplicate_pair(signal, portfolio),
@@ -69,6 +71,18 @@ class RiskManagerAgent:
             return False, (
                 f"{RiskRejectionReason.TOO_MANY_POSITIONS}: "
                 f"{portfolio.open_position_count}/{self.cfg.max_open_positions}"
+            )
+        return True, ""
+
+    def _check_correlation(self, signal: TradingSignal, portfolio: PortfolioState) -> tuple[bool, str]:
+        """Không quá 2 vị thế cùng hướng — tránh 3× LONG exposure khi BTC dump"""
+        if not portfolio.open_trades:
+            return True, ""
+        same_dir = sum(1 for t in portfolio.open_trades if t.direction.value == signal.direction.value)
+        if same_dir >= 2:
+            return False, (
+                f"{RiskRejectionReason.CORRELATION_RISK}: "
+                f"already {same_dir} {signal.direction.value} positions open"
             )
         return True, ""
 

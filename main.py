@@ -85,7 +85,7 @@ class TradingOrchestrator:
                     f"🤖 *Trading Agent Started*\n"
                     f"Mode: `{'PAPER' if cfg.trading.paper_trading else 'LIVE'}`\n"
                     f"Pairs: `{', '.join(pair_names)}`\n"
-                    f"Scan interval: `every 15 min`"
+                    f"Scan interval: `every {cfg.scan.scan_interval_min} min` ({cfg.scan.trading_style})"
                 )
             except Exception as e:
                 logger.warning(f"Telegram unavailable ({e}), running without notifications")
@@ -97,18 +97,29 @@ class TradingOrchestrator:
         scan_min = cfg.scan.scan_interval_min
         monitor_min = cfg.scan.position_monitor_interval_min
         logger.info(f"Scan interval: {scan_min} min | Position monitor: {monitor_min} min ({cfg.scan.trading_style})")
+
+        # misfire_grace_time: mặc định 1s → job trễ >1s bị skip. Scalp scan có thể 5–15 phút
+        # (fetch tickers, premium, nhiều pairs, Claude API) → tăng lên để lần chạy tiếp vẫn chạy
+        # coalesce=True: nếu nhiều lần bị miss, chỉ chạy 1 lần khi có thể
+        scan_misfire_sec = max(600, scan_min * 120)  # ít nhất 10 phút, hoặc 2× interval
+        monitor_misfire_sec = max(120, monitor_min * 60)  # ít nhất 2 phút
+
         self.scheduler.add_job(
             self._scan_market,
             "interval",
             minutes=scan_min,
             id="market_scan",
             next_run_time=datetime.now(),  # Run immediately on start
+            misfire_grace_time=scan_misfire_sec,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self._monitor_positions,
             "interval",
             minutes=monitor_min,
             id="position_monitor",
+            misfire_grace_time=monitor_misfire_sec,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self._daily_report,
@@ -122,12 +133,15 @@ class TradingOrchestrator:
             "interval",
             minutes=5,
             id="circuit_breaker",
+            misfire_grace_time=300,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self._heartbeat,
             "interval",
             hours=6,  # Plan: mỗi 6 giờ (tránh spam Telegram)
             id="heartbeat",
+            misfire_grace_time=600,
         )
 
         self.scheduler.start()
@@ -160,6 +174,7 @@ class TradingOrchestrator:
             for signal in signals:
                 await self._process_signal(signal)
 
+            logger.info(f"Market scan done ({len(signals)} signals)")
         except Exception as e:
             logger.error(f"Market scan error: {e}")
             await self.telegram.send_message(f"⚠️ Market scan error: {e}")
@@ -298,6 +313,42 @@ class TradingOrchestrator:
                                     t["stop_loss"] = new_sl
                                     t["sl_trailing_state"] = "breakeven"
                                     logger.info(f"Trail stop: {t['pair']} SL → breakeven")
+
+                    # Time-based exit (scalp): không giữ quá 45 phút
+                    if cfg.scan.trading_style == "scalp" and t.get("opened_at"):
+                        try:
+                            opened_at = datetime.fromisoformat(t["opened_at"].replace("Z", "+00:00"))
+                            hold_minutes = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
+                            if hold_minutes > 45:
+                                quantity = t["quantity"]
+                                exit_price = current_price
+                                if direction == Direction.LONG:
+                                    pnl = (exit_price - t["entry_price"]) * quantity
+                                else:
+                                    pnl = (t["entry_price"] - exit_price) * quantity
+                                FEE_PCT = 0.001
+                                fee_cost = t["position_size_usdt"] * FEE_PCT * 2
+                                pnl = pnl - fee_cost
+                                pnl_pct = pnl / t["position_size_usdt"] * 100
+                                self.db.close_trade(
+                                    trade_id=t["id"],
+                                    status=TradeStatus.TOOK_PROFIT.value,
+                                    closed_at=datetime.now(timezone.utc).isoformat(),
+                                    exit_price=exit_price,
+                                    pnl_usdt=pnl,
+                                    pnl_pct=pnl_pct,
+                                    fees_usdt=fee_cost,
+                                )
+                                await self.telegram.send_message(
+                                    f"⏱ *Time Exit* [PAPER]\n"
+                                    f"{t['pair']} {t['direction']}\n"
+                                    f"Held {hold_minutes:.0f}min > 45min\n"
+                                    f"Exit: `${exit_price:,.2f}` | PnL: `${pnl:+.2f}` ({pnl_pct:+.1f}%)"
+                                )
+                                logger.info(f"[TIME EXIT] {t['pair']} held {hold_minutes:.0f}min, closed PnL=${pnl:+.2f}")
+                                continue  # Đã close, skip hit_sl/hit_tp
+                        except Exception as ex:
+                            logger.warning(f"Time exit parse error for {t['pair']}: {ex}")
 
                     hit_sl = (direction == Direction.LONG and current_price <= t["stop_loss"]) or \
                              (direction == Direction.SHORT and current_price >= t["stop_loss"])

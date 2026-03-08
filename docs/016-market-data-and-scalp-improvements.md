@@ -490,6 +490,25 @@ VWAP = (HLC/3 × volume).sum() / volume.sum(). `vwap_distance_pct` = % distance 
 
 ---
 
+## Production scalping improvements (2025-03)
+
+| Feature | File | Mô tả |
+|---------|------|-------|
+| **Correlation filter** | risk_manager.py | Không quá 2 vị thế cùng hướng (LONG/SHORT) |
+| **Time-based exit** | main.py | Scalp: force close sau 45 phút (opened_at) |
+| **Chop Index** | market_data.py, models.py | < 38.2 trending, > 61.8 skip (scalp) |
+| **News blackout** | research_agent.py | High-impact event trong 30 phút → skip cycle |
+| **get_recent_performance** | database.py | Rolling win_rate, avg_rr trên 20 trades |
+| **Dynamic confluence** | research_agent.py | Win rate < 45% → MIN_CONFLUENCE=4 |
+
+**Backtest engine** (`backtest.py`) đã tích hợp tất cả filters trên:
+- Chop Index: `--no-chop` để tắt
+- Correlation: `--no-correlation` (multi-symbol dùng `run_backtest_combined`)
+- Dynamic confluence: `--no-dynamic-confluence` để tắt
+- News blackout: không có historical calendar → bỏ qua trong backtest
+
+---
+
 ## RELAX_FILTER
 
 Khi `RELAX_FILTER=true` (test pipeline), các filter sau được bỏ qua:

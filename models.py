@@ -70,6 +70,7 @@ class TechnicalSignal(BaseModel):
     # Order flow (production scalping)
     vwap: float = 0.0                   # VWAP intraday
     vwap_distance_pct: float = 0.0       # % distance, dương = trên VWAP
+    chop_index: float = 50.0             # < 38.2 trending, > 61.8 choppy
 
 
 class WhaleSignal(BaseModel):

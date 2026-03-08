@@ -374,6 +374,30 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_recent_performance(self, last_n: int = 20) -> dict:
+        """Rolling performance trên N trades gần nhất. Dùng cho dynamic confluence."""
+        rows = self.conn.execute(
+            """
+            SELECT pnl_pct, pnl_usdt
+            FROM trades
+            WHERE status IN ('TOOK_PROFIT', 'STOPPED')
+            ORDER BY closed_at DESC LIMIT ?
+            """,
+            (last_n,),
+        ).fetchall()
+        if len(rows) < 5:
+            return {"win_rate": None, "avg_rr": None, "sample_size": len(rows)}
+        wins = [r for r in rows if (r["pnl_usdt"] or 0) > 0]
+        losses = [r for r in rows if (r["pnl_usdt"] or 0) <= 0]
+        win_rate = len(wins) / len(rows)
+        avg_win = sum(r["pnl_pct"] or 0 for r in wins) / len(wins) if wins else 0
+        avg_loss = abs(sum(r["pnl_pct"] or 0 for r in losses) / len(losses)) if losses else 1
+        return {
+            "win_rate": win_rate,
+            "avg_rr": avg_win / avg_loss if avg_loss > 0 else 0,
+            "sample_size": len(rows),
+        }
+
     # ─── Agent Logs ──────────────────────────────────────────────────────────
 
     def log(self, agent: str, level: str, message: str, data: dict = None):

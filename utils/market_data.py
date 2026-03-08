@@ -385,6 +385,13 @@ class BinanceDataFetcher:
         if style == "scalp" and (len(df_atr) < min_rows or len(df_adx) < min_rows):
             raise ValueError(f"Insufficient data for {symbol}")
 
+        def _calc_chop_index(df: pd.DataFrame, period: int = 14) -> float:
+            """Chop Index: < 38.2 trending, > 61.8 choppy. Dùng pandas_ta.chop."""
+            chop_series = ta.chop(df["high"], df["low"], df["close"], length=period, atr_length=1)
+            if chop_series is None or chop_series.empty or pd.isna(chop_series.iloc[-1]):
+                return 50.0
+            return float(chop_series.iloc[-1])
+
         def _safe_rsi(df: pd.DataFrame, length: int = 14, default: float = 50.0) -> float:
             s = ta.rsi(df["close"], length=length)
             if s is None or s.empty or pd.isna(s.iloc[-1]):
@@ -612,6 +619,7 @@ class BinanceDataFetcher:
                     atr_ratio_regime = float(atr14_1h.iloc[-1]) / a50
 
         current_price = float(df_fast["close"].iloc[-1])
+        chop_index = _calc_chop_index(df_fast, 14)
         return TechnicalSignal(
             rsi_1h=rsi_1h,
             rsi_4h=rsi_4h,
@@ -647,6 +655,7 @@ class BinanceDataFetcher:
             ema9_crossed_recent_down=ema9_crossed_recent_down,
             vwap=vwap_val,
             vwap_distance_pct=vwap_distance_pct,
+            chop_index=chop_index,
         )
 
     async def close(self):

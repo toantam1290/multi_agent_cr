@@ -6,6 +6,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+import httpx
 from anthropic import AsyncAnthropic
 from loguru import logger
 
@@ -141,16 +142,18 @@ class ResearchAgent:
         pair: str,
         prefetched_sentiment: Optional[SentimentSignal] = None,
         session: Optional[str] = None,
+        min_confluence: int = 3,
     ) -> tuple[Optional[TradingSignal], dict]:
         """Wrapper: gate với _pair_semaphore, tối đa 5 pairs phân tích đồng thời."""
         async with self._pair_semaphore:
-            return await self._analyze_pair_inner(pair, prefetched_sentiment, session)
+            return await self._analyze_pair_inner(pair, prefetched_sentiment, session, min_confluence)
 
     async def _analyze_pair_inner(
         self,
         pair: str,
         prefetched_sentiment: Optional[SentimentSignal] = None,
         session: Optional[str] = None,
+        min_confluence: int = 3,
     ) -> tuple[Optional[TradingSignal], dict]:
         """
         Phân tích một cặp tiền → trả về (TradingSignal | None, metadata).
@@ -280,6 +283,12 @@ class ResearchAgent:
                 self.db.log("research_agent", "INFO", f"Skip scalp for {pair}: volatile regime", {"pair": pair})
                 return None, meta
 
+            # Chop Index: > 61.8 = choppy, skip (RELAX: bỏ qua)
+            if style == "scalp" and not relax and technical.chop_index > 61.8:
+                logger.info(f"{pair}: Chop index {technical.chop_index:.1f} > 61.8, skip")
+                self.db.log("research_agent", "INFO", f"Skip {pair}: choppy", {"pair": pair, "chop_index": technical.chop_index})
+                return None, meta
+
             if not (technical.atr_value > 0):
                 logger.warning(f"{pair}: ATR invalid ({technical.atr_value}), skipping")
                 return None, meta
@@ -324,10 +333,9 @@ class ResearchAgent:
                 confluence_score += 1
             if direction == "SHORT" and 0 <= technical.vwap_distance_pct <= 0.5:
                 confluence_score += 1
-            MIN_CONFLUENCE = 3  # Cân nhắc nâng 4/9 khi có data thực tế
-            if not relax and confluence_score < MIN_CONFLUENCE:
+            if not relax and confluence_score < min_confluence:
                 meta["confluence_rejected"] = True
-                logger.info(f"{pair}: Confluence {confluence_score}/9 < {MIN_CONFLUENCE}, skip Claude")
+                logger.info(f"{pair}: Confluence {confluence_score}/9 < {min_confluence}, skip Claude")
                 self.db.log("research_agent", "INFO", f"Confluence low {pair}", {"pair": pair, "score": confluence_score})
                 return None, meta
 
@@ -765,6 +773,28 @@ DATA:
             )
             return []
 
+        # News blackout (scalp): skip cycle nếu có High-impact event trong 30 phút
+        if sc.trading_style == "scalp" and not getattr(sc, "relax_filter", False):
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+                    events = r.json()
+                now = datetime.now(timezone.utc)
+                for ev in events:
+                    if ev.get("impact") != "High":
+                        continue
+                    try:
+                        ev_time = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+                        if ev_time.tzinfo is None:
+                            ev_time = ev_time.replace(tzinfo=timezone.utc)
+                        if abs((now - ev_time).total_seconds()) < 1800:
+                            logger.info(f"News blackout: {ev.get('title', '?')} — skip scalp cycle")
+                            return []
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"News calendar fetch failed: {e}")
+
         # Fear & Greed: fetch 1 lần cho cả cycle (daily index, giống nhau mọi pair)
         try:
             shared_sentiment = await self.fear_greed.get()
@@ -773,9 +803,17 @@ DATA:
             logger.warning(f"Fear & Greed pre-fetch failed: {e}, fallback fetch riêng từng pair")
             shared_sentiment = None
 
+        # Dynamic confluence: thắt chặt khi win rate < 45% (last 20 trades)
+        perf = self.db.get_recent_performance(20)
+        min_confluence = 3
+        if perf["win_rate"] is not None:
+            if perf["win_rate"] < 0.45:
+                min_confluence = 4
+                logger.warning(f"Win rate {perf['win_rate']:.0%} < 45% (last {perf['sample_size']}), raising confluence to 4")
+
         # _pair_semaphore tự động chia batch 5 — tối đa 5 pairs đồng thời
         results = await asyncio.gather(
-            *[self.analyze_pair(pair, prefetched_sentiment=shared_sentiment, session=session) for pair in pairs_to_scan],
+            *[self.analyze_pair(pair, prefetched_sentiment=shared_sentiment, session=session, min_confluence=min_confluence) for pair in pairs_to_scan],
             return_exceptions=True,
         )
 
