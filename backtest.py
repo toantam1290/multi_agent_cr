@@ -435,14 +435,14 @@ def compute_indicators(
     bullish = bearish = 0
     momentum_bullish = momentum_bearish = False
 
-    if 40 <= rsi_1h <= 50 and trend_1d == "uptrend":
+    if 50 < rsi_1h <= 65 and trend_1d == "uptrend":
         bullish += 5
-    elif 50 < rsi_1h <= 60 and trend_1d == "downtrend":
+    elif 35 <= rsi_1h < 50 and trend_1d == "downtrend":
         bearish += 5
-    if 52 < rsi_1h < 75:
-        bullish += 20   # momentum đang tăng, chưa overbought (trend-following)
-    if 25 < rsi_1h < 48:
-        bearish += 20   # momentum đang giảm, chưa oversold (trend-following)
+    if 52 < rsi_1h < 75 and trend_1d == "uptrend":
+        bullish += 20
+    if 25 < rsi_1h < 48 and trend_1d == "downtrend":
+        bearish += 20
 
     if style == "scalp":
         if rsi_4h < 40 and trend_1d == "uptrend":
@@ -659,7 +659,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     # LONG
     if rule_case != "short_only":
         long_ok = (
-            ind["trend_1d"] != "downtrend"
+            ind["trend_1d"] == "uptrend"
             and rsi_long_min < ind["rsi_1h"] < rsi_long_max
             and funding_pct < config.funding_long_max_pct
             and ind["net_score"] > net_long_min
@@ -675,7 +675,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     # SHORT
     if rule_case != "long_only":
         short_ok = (
-            ind["trend_1d"] != "uptrend"
+            ind["trend_1d"] == "downtrend"
             and rsi_short_min < ind["rsi_1h"] < rsi_short_max
             and funding_pct > 0.005
             and ind["net_score"] < net_short_max
@@ -928,7 +928,7 @@ def run_backtest_for_symbol(
         df_atr_key = "1h"     # ATR(1h) đủ lớn để cover fee; 5m quá nhỏ
         df_adx_key = "1h"
         df_trend_key = "4h"
-        max_hold = MAX_HOLD_CANDLES_SCALP
+        max_hold = 12         # 12 × 5m = 60 phút, đủ để ATR(1h) move
         future_tf = "5m"      # Simulate outcome trên 5m candles
     else:
         step_tf = "1h"
@@ -1010,7 +1010,7 @@ def run_backtest_for_symbol(
         session = get_session(step_ts)
         funnel["total"] += 1
         if config.use_session_filter and style == "scalp":
-            if session == "dead_zone":
+            if session not in ("london", "ny_overlap"):
                 funnel["session"] += 1
                 continue
 
@@ -1169,7 +1169,7 @@ def run_backtest_for_symbol(
     if verbose and total > 0:
         print(f"\n  Filter Funnel [{symbol}] ({total} candles scanned):")
         for label, key in [
-            ("dead_zone skip",  "session"),
+            ("session skip (asia/dead)", "session"),
             ("rule filter",     "rule"),
             ("CVD proxy",       "cvd"),
             ("VWAP bias",       "vwap"),
@@ -1261,8 +1261,8 @@ def run_backtest_combined(
 
     style = config.style
     if style == "scalp":
-        step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "15m", "15m", "5m", "5m", "1h", "4h"
-        max_hold, future_tf = MAX_HOLD_CANDLES_SCALP, "5m"
+        step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "15m", "15m", "5m", "1h", "1h", "4h"
+        max_hold, future_tf = 12, "5m"  # 12×5m=60min match ATR(1h)
     else:
         step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "1h", "1h", "4h", "1h", "4h", "1d"
         max_hold, future_tf = MAX_HOLD_CANDLES_SWING, "1h"
@@ -1316,7 +1316,7 @@ def run_backtest_combined(
                 continue
 
             session = get_session(step_ts)
-            if config.use_session_filter and style == "scalp" and session == "dead_zone":
+            if config.use_session_filter and style == "scalp" and session not in ("london", "ny_overlap"):
                 continue
 
             funding_rate = get_funding_at(funding_df, step_ts)
@@ -1720,7 +1720,7 @@ Examples:
         args.no_cvd = True
         args.no_momentum_gate = True
         if args.net_score == 0:
-            args.net_score = 5
+            args.net_score = 3
         if args.confluence == 3:
             args.confluence = 1
 

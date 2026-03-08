@@ -54,7 +54,7 @@ def build_config(
         no_ema9 = True
         no_cvd = True
         no_momentum_gate = True
-        net_score = net_score or 5
+        net_score = net_score or 3
         confluence = 1 if confluence == 3 else confluence
 
     return BacktestConfig(
