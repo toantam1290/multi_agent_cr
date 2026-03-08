@@ -107,6 +107,7 @@ class DerivativesSignal(BaseModel):
     basis_pct: float = 0.0             # (mark - index) / index * 100
     signal: str = "NEUTRAL"            # LONG_SQUEEZE | SHORT_SQUEEZE | NEUTRAL
     score: int = Field(0, ge=-100, le=100)
+    fetch_ok: bool = True              # False khi API fail → skip confluence
 
 
 # ─── Main Signal ─────────────────────────────────────────────────────────────

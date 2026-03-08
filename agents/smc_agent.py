@@ -1,13 +1,13 @@
 """
 agents/smc_agent.py - Standalone SMC Agent
 
-Chạy hoàn toàn độc lập, không cần:
-  - rule-based filter từ ResearchAgent
-  - CVD, VWAP, EMA9, whale data
-  - Chỉ cần: OHLCV data đa timeframe
+Chạy hoàn toàn độc lập. Tích hợp crypto confluence:
+  - Funding Rate, Open Interest, CVD (xem docs/027-crypto-confluence-smc.md)
+  - OHLCV data đa timeframe
 
 Flow:
-  Fetch multi-TF → SMCStrategy → SMCSetup → TradingSignal → Telegram alert
+  Fetch multi-TF + deriv + CVD song song → SMCStrategy → SMCSetup
+  → Confluence adjust confidence → TradingSignal → Telegram alert
 """
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ from typing import Optional
 
 from loguru import logger
 
-from config import cfg, ALLOWED_PAIRS
+from config import cfg, ALLOWED_PAIRS, get_effective_min_confidence
 from database import Database
 from models import TradingSignal, Direction, SignalStatus, TechnicalSignal, WhaleSignal, SentimentSignal
 from utils.market_data import BinanceDataFetcher
 from utils.smc_strategy import SMCStrategy, SMCSetup
+from utils.crypto_confluence import interpret_funding, interpret_oi, interpret_cvd
 
 
 class SMCAgent:
@@ -40,16 +41,75 @@ class SMCAgent:
 
     async def scan_pair(self, symbol: str) -> Optional[TradingSignal]:
         """
-        Phân tích 1 pair bằng SMC thuần.
+        Phân tích 1 pair bằng SMC + crypto confluence (Funding, OI, CVD).
         Trả về TradingSignal nếu có setup hợp lệ, None nếu không.
         """
         async with self._pair_semaphore:
             try:
                 style = cfg.scan.trading_style or "scalp"
-                setup = await self.strategy.analyze(symbol, style=style)
 
-                if setup is None or not setup.valid:
+                # Fetch SMC + derivatives + CVD song song (futures cho khớp với funding/OI)
+                setup_task = self.strategy.analyze(symbol, style=style)
+                deriv_task = self.binance.get_derivatives_signal(symbol)
+                cvd_task = self.binance.get_cvd_signal(symbol, limit=500, use_futures=True)
+                stats_task = self.binance.get_24h_stats(symbol, use_futures=True)
+
+                setup, deriv, cvd_data, stats_24h = await asyncio.gather(
+                    setup_task, deriv_task, cvd_task, stats_task,
+                    return_exceptions=True,
+                )
+
+                if isinstance(setup, Exception) or setup is None or not setup.valid:
                     return None
+
+                if isinstance(deriv, Exception):
+                    deriv = None
+                if isinstance(cvd_data, Exception):
+                    cvd_data = None
+                if isinstance(stats_24h, Exception):
+                    stats_24h = None
+
+                base_confidence = setup.confidence
+                confidence = base_confidence
+                confluence_notes = []
+
+                # Lớp 1: Funding Rate (chỉ khi fetch OK — tránh magic number)
+                if deriv and deriv.fetch_ok:
+                    fr_mult, fr_note = interpret_funding(deriv.funding_rate, setup.direction)
+                    confidence = int(confidence * fr_mult)
+                    confluence_notes.append(fr_note)
+
+                # Lớp 2: Open Interest (cần deriv.fetch_ok — OI từ cùng API)
+                if deriv and deriv.fetch_ok and stats_24h and deriv.oi_change_pct != 0:
+                    oi_mult, oi_note = interpret_oi(
+                        deriv.oi_change_pct,
+                        stats_24h.get("price_change_pct", 0),
+                        setup.direction,
+                    )
+                    confidence = int(confidence * oi_mult)
+                    confluence_notes.append(oi_note)
+
+                # Lớp 3: CVD
+                if cvd_data:
+                    ltf = setup.ltf_signal
+                    in_ob = ltf.price_in_ob if ltf else False
+                    in_fvg = ltf.price_in_fvg if ltf else False
+                    cvd_mult, cvd_note = interpret_cvd(cvd_data, setup.direction, in_ob, in_fvg)
+                    confidence = int(confidence * cvd_mult)
+                    confluence_notes.append(cvd_note)
+
+                confidence = max(0, min(100, confidence))
+                min_conf = get_effective_min_confidence()
+                if confidence < min_conf:
+                    logger.info(
+                        f"SMCAgent {symbol}: rejected after confluence adj "
+                        f"(base={base_confidence} → {confidence} < {min_conf}) | {' | '.join(confluence_notes)}"
+                    )
+                    return None
+
+                setup.confidence = confidence
+                if confluence_notes:
+                    setup.reasoning += " | Confluence: " + " | ".join(confluence_notes)
 
                 available = await self._get_available_balance()
                 position_size = min(
@@ -82,7 +142,7 @@ class SMCAgent:
                     f"entry={setup.entry:.2f} sl={setup.sl:.2f} "
                     f"tp1={setup.tp1:.2f} tp2={setup.tp2:.2f} "
                     f"model={setup.entry_model} quality={setup.entry_model_quality} "
-                    f"RR={setup.risk_reward_tp1:.1f}/{setup.risk_reward_tp2:.1f}"
+                    f"conf={base_confidence}→{confidence} RR={setup.risk_reward_tp1:.1f}/{setup.risk_reward_tp2:.1f}"
                 )
                 return signal
 

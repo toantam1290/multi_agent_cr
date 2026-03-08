@@ -131,15 +131,19 @@ class BinanceDataFetcher:
             logger.warning(f"get_orderbook_data failed for {symbol}: {e}")
             return {"spread_pct": 999.0, "imbalance": 1.0, "bid_stack": 0.0, "ask_stack": 0.0}
 
-    async def get_cvd_signal(self, symbol: str, limit: int = 500) -> dict:
+    async def get_cvd_signal(self, symbol: str, limit: int = 500, use_futures: bool = False) -> dict:
         """
         CVD từ aggTrades — buy_vol - sell_vol.
         isBuyerMaker=False (m=0) → market BUY → CVD tăng
         isBuyerMaker=True (m=1) → market SELL → CVD giảm
+
+        use_futures=True: dùng futures aggTrades (cho SMC confluence với funding/OI).
+        use_futures=False: spot aggTrades (mặc định, backward compatible).
         """
+        base_url = self._futures_base if use_futures else self.base
         try:
             resp = await _http_get_with_retry(
-                self._client, f"{self.base}/aggTrades", params={"symbol": symbol, "limit": limit}
+                self._client, f"{base_url}/aggTrades", params={"symbol": symbol, "limit": limit}
             )
             resp.raise_for_status()
             trades = resp.json()
@@ -181,8 +185,12 @@ class BinanceDataFetcher:
             logger.warning(f"get_cvd_signal failed for {symbol}: {e}")
             return {"cvd": 0.0, "cvd_ratio": 0.5, "buy_vol": 0.0, "sell_vol": 0.0, "cvd_trend": "neutral"}
 
-    async def get_24h_stats(self, symbol: str) -> dict:
-        resp = await self._client.get(f"{self.base}/ticker/24hr", params={"symbol": symbol})
+    async def get_24h_stats(self, symbol: str, use_futures: bool = False) -> dict:
+        """
+        24h ticker stats. use_futures=True: futures price (cho OI×Price logic, khớp với derivatives).
+        """
+        base_url = self._futures_base if use_futures else self.base
+        resp = await self._client.get(f"{base_url}/ticker/24hr", params={"symbol": symbol})
         resp.raise_for_status()
         d = resp.json()
         return {
@@ -308,8 +316,8 @@ class BinanceDataFetcher:
                 hist_resp.raise_for_status()
                 hist = hist_resp.json()
                 if len(hist) >= 2:
-                    curr = float(hist[0].get("sumOpenInterestValue", 0))
-                    prev = float(hist[1].get("sumOpenInterestValue", 0))
+                    prev = float(hist[0].get("sumOpenInterestValue", 0))  # ascending: hist[0]=cũ
+                    curr = float(hist[1].get("sumOpenInterestValue", 0))  # hist[1]=mới nhất
                     oi_change_pct = (curr - prev) / prev * 100 if prev > 0 else 0
             except Exception:
                 pass
@@ -342,8 +350,7 @@ class BinanceDataFetcher:
             )
         except Exception as e:
             logger.warning(f"Derivatives signal failed ({symbol}): {e}")
-            # funding_rate=0.0005 (0.05%) → không pass LONG (<0.05) cũng không pass SHORT (>0.05)
-            return DerivativesSignal(funding_rate=0.0005)
+            return DerivativesSignal(funding_rate=0.0005, fetch_ok=False)
 
     async def compute_technical_signal(self, symbol: str, style: str = "swing") -> TechnicalSignal:
         """
