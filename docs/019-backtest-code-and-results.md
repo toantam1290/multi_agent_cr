@@ -244,6 +244,32 @@ python scripts/run_backtest_full_report.py --days 90 --use-cache --steps 2,3,5,7
 python backtest.py --symbol BTCUSDT --days 60 --use-cache --funnel
 ```
 
+### Quy trình workflow (4 bước sau khi sửa ATR/RSI/entry)
+
+```bash
+# Bước 1 & 2 — Fix fee + Full 5 thay đổi (loose, 90d, funnel)
+python backtest.py --symbol BTCUSDT --days 90 --use-cache --strategy loose --funnel
+
+# Bước 3 — Mở rộng (v2, BTCUSDT+ETHUSDT, 180d, funnel)
+python backtest.py --symbol BTCUSDT,ETHUSDT --days 180 --use-cache --strategy v2 --funnel
+
+# Bước 4 — Walk-forward (v2, 180d, train 90, test 30)
+python backtest.py --symbol BTCUSDT --days 180 --use-cache --strategy v2 \
+  --walk-forward --wf-train 90 --wf-test 30
+```
+
+**Script tự động chạy 4 bước:**
+```bash
+python scripts/run_workflow_backtest.py
+python scripts/run_workflow_backtest.py --no-cache
+```
+
+**run_backtest_full_report.py với workflow params:**
+```bash
+python scripts/run_backtest_full_report.py --days 90 --use-cache \
+  --days-step4 180 --days-step5 180 --steps 2,3,4,5
+```
+
 ---
 
 ## 9. Khuyến nghị

@@ -78,7 +78,7 @@ def build_config(
         net_score_min=net_score,
         rule_case=kwargs.get("rule_case", "full"),
         confluence_threshold=confluence,
-        scalp_rr=kwargs.get("rr", 1.5),
+        scalp_rr=kwargs.get("rr", 2.0),
         swing_rr=kwargs.get("swing_rr", 2.0),
         walk_forward=kwargs.get("walk_forward", False),
         wf_train_days=kwargs.get("wf_train_days", 90),
@@ -98,11 +98,16 @@ async def main():
     p.add_argument("--output", default="docs/018-backtest-full-report.txt", help="Output report path")
     p.add_argument("--wf-train", type=int, default=90)
     p.add_argument("--wf-test", type=int, default=30)
+    p.add_argument("--days-step4", type=int, default=0, help="Override days for step 4 (0=use --days). Workflow Buoc 3: 180")
+    p.add_argument("--days-step5", type=int, default=0, help="Override days for step 5 (0=use --days). Workflow Buoc 4: 180")
     args = p.parse_args()
 
     steps_to_run = {int(s.strip()) for s in args.steps.split(",") if s.strip()}
     symbols = [s.strip().upper() for s in args.symbol.split(",")]
     multi_symbols = [s.strip().upper() for s in args.multi_symbol.split(",")]
+
+    # Days for data load: step 4/5 workflow may need 180d
+    days_load = max(args.days, args.days_step4 or args.days, args.days_step5 or args.days)
 
     # All symbols we need (for step 4)
     all_symbols_needed = list(dict.fromkeys(symbols + ([x for x in multi_symbols if x not in symbols] if 4 in steps_to_run else [])))
@@ -118,7 +123,7 @@ async def main():
     if 1 in steps_to_run and not args.skip_download:
         report_lines.append("## Step 1: Download data")
         report_lines.append("")
-        config0 = build_config(all_symbols_needed, args.days)
+        config0 = build_config(all_symbols_needed, days_load)
         print("[Step 1] Downloading data...")
         all_data = await download_all_data(config0, use_cache=args.use_cache, download_only=True)
         report_lines.append("  Data saved to data/backtest_cache/")
@@ -128,7 +133,7 @@ async def main():
         all_data = await download_all_data(config0, use_cache=True, download_only=False)
     else:
         print("[Step 1] Skipped (--skip-download or not in --steps)")
-        config0 = build_config(all_symbols_needed, args.days)
+        config0 = build_config(all_symbols_needed, days_load)
         all_data = await download_all_data(config0, use_cache=args.use_cache, download_only=False)
 
     if not all_data:
@@ -139,13 +144,13 @@ async def main():
     date_from = now - timedelta(days=args.days)
     date_to = now
 
-    # Step 2: Funnel diagnosis
+    # Step 2: Funnel diagnosis (dùng loose để match workflow Bước 1/2)
     if 2 in steps_to_run:
-        report_lines.append("## Step 2: Filter Funnel Diagnosis")
+        report_lines.append("## Step 2: Filter Funnel Diagnosis (strategy loose)")
         report_lines.append("")
-        print("[Step 2] Running funnel diagnosis...")
-        config = build_config(symbols, 60, strategy="")  # 60 days for funnel
-        cfg_date_from = now - timedelta(days=60)
+        print("[Step 2] Running funnel diagnosis (loose)...")
+        config = build_config(symbols, min(args.days, 90), strategy="loose")
+        cfg_date_from = now - timedelta(days=min(args.days, 90))
         cfg_date_to = now
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -189,14 +194,17 @@ async def main():
         report_lines.append("  Target v2: >=100 trades, PF>=1.2, Win%>=52%")
         report_lines.append("")
 
-    # Step 4: Multi-symbol
+    # Step 4: Multi-symbol (workflow Buoc 3: BTCUSDT,ETHUSDT, 180d)
     if 4 in steps_to_run:
+        days_4 = args.days_step4 or args.days
         report_lines.append("## Step 4: Multi-Symbol (v2)")
         report_lines.append("")
-        print("[Step 4] Running multi-symbol...")
-        config = build_config(multi_symbols, args.days, strategy="v2")
-        trades = run_backtest_combined(multi_symbols, all_data, config, date_from, date_to)
-        stats = calc_stats(trades, config, date_from, date_to)
+        print(f"[Step 4] Running multi-symbol ({days_4}d)...")
+        config = build_config(multi_symbols, days_4, strategy="v2")
+        date_from_4 = now - timedelta(days=days_4)
+        date_to_4 = now
+        trades = run_backtest_combined(multi_symbols, all_data, config, date_from_4, date_to_4)
+        stats = calc_stats(trades, config, date_from_4, date_to_4)
 
         report_lines.append(f"  Symbols: {', '.join(multi_symbols)}")
         report_lines.append(f"  Trades: {len(trades)} | Win%: {stats.win_rate:.1f} | PF: {stats.profit_factor:.2f} | "
@@ -204,12 +212,13 @@ async def main():
         report_lines.append("")
         print(f"    {len(trades)} trades, win={stats.win_rate:.1f}%, PF={stats.profit_factor:.2f}")
 
-    # Step 5: Walk-forward
+    # Step 5: Walk-forward (workflow Buoc 4: 180d, train 90, test 30)
     if 5 in steps_to_run:
+        days_5 = args.days_step5 or args.days
         report_lines.append("## Step 5: Walk-Forward Validation")
         report_lines.append("")
-        print("[Step 5] Running walk-forward...")
-        config = build_config(symbols, args.days, strategy="v2",
+        print(f"[Step 5] Running walk-forward ({days_5}d)...")
+        config = build_config(symbols, days_5, strategy="v2",
                               wf_train_days=args.wf_train, wf_test_days=args.wf_test)
         config = replace(config, walk_forward=True, wf_train_days=args.wf_train, wf_test_days=args.wf_test)
 

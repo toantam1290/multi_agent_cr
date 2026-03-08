@@ -49,7 +49,7 @@ import pandas_ta as ta
 
 FEE_PCT = 0.001          # 0.1% mỗi chiều
 SLIPPAGE_PCT = 0.0005    # 0.05% slippage khi fill
-SCALP_RR = 1.5
+SCALP_RR = 2.0
 SWING_RR = 2.0
 MAX_HOLD_CANDLES_SCALP = 9    # 9 × 5m = 45 phút
 MAX_HOLD_CANDLES_SWING = 48   # 48 × 1h = 2 ngày
@@ -439,10 +439,10 @@ def compute_indicators(
         bullish += 5
     elif 50 < rsi_1h <= 60 and trend_1d == "downtrend":
         bearish += 5
-    if rsi_1h < 40:
-        bullish += 20
-    if rsi_1h > 70:
-        bearish += 20
+    if 52 < rsi_1h < 75:
+        bullish += 20   # momentum đang tăng, chưa overbought (trend-following)
+    if 25 < rsi_1h < 48:
+        bearish += 20   # momentum đang giảm, chưa oversold (trend-following)
 
     if style == "scalp":
         if rsi_4h < 40 and trend_1d == "uptrend":
@@ -454,10 +454,10 @@ def compute_indicators(
             r0 = float(rsi_series.iloc[-2])
             r1 = float(rsi_series.iloc[-3])
             r2 = float(rsi_series.iloc[-4])
-            if rsi_1h < 45 and r0 > r1 and r1 > r2 and (r0 - r2) > 2.0:
+            if rsi_1h > 50 and r0 > r1 and r1 > r2 and (r0 - r2) > 2.0:
                 bullish += 15
                 momentum_bullish = True
-            if rsi_1h > 55 and r0 < r1 and r1 < r2 and (r2 - r0) > 2.0:
+            if rsi_1h < 50 and r0 < r1 and r1 < r2 and (r2 - r0) > 2.0:
                 bearish += 15
                 momentum_bearish = True
         if len(df_fast) >= 2:
@@ -628,8 +628,16 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     """
     funding_pct = funding_rate * 100
     style = config.style
-    rsi_long_max = config.scalp_rsi_long_max if style == "scalp" else 45.0
-    rsi_short_min = config.scalp_rsi_short_min if style == "scalp" else 55.0
+    # Trend-following: LONG cần RSI > 50 (momentum up), SHORT cần RSI < 50
+    rsi_long_max = 78.0   # Hard ceiling tránh overbought extreme
+    rsi_long_min = 50.0   # Trend-following lower bound
+    rsi_short_min = 22.0  # Hard floor tránh oversold extreme
+    rsi_short_max = 50.0  # Trend-following upper bound
+    if style != "scalp":
+        rsi_long_max = config.scalp_rsi_long_max
+        rsi_long_min = 35.0
+        rsi_short_min = config.scalp_rsi_short_min
+        rsi_short_max = 65.0
     rule_case = getattr(config, "rule_case", "full")
     use_momentum_gate = getattr(config, "use_momentum_gate", True)
 
@@ -652,7 +660,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     if rule_case != "short_only":
         long_ok = (
             ind["trend_1d"] != "downtrend"
-            and ind["rsi_1h"] < rsi_long_max
+            and rsi_long_min < ind["rsi_1h"] < rsi_long_max
             and funding_pct < config.funding_long_max_pct
             and ind["net_score"] > net_long_min
         )
@@ -668,7 +676,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     if rule_case != "long_only":
         short_ok = (
             ind["trend_1d"] != "uptrend"
-            and ind["rsi_1h"] > rsi_short_min
+            and rsi_short_min < ind["rsi_1h"] < rsi_short_max
             and funding_pct > 0.005
             and ind["net_score"] < net_short_max
         )
@@ -738,7 +746,7 @@ def calc_entry_sl_tp(
     if style == "scalp":
         rr = rr_ratio
         if direction == "LONG":
-            entry = current_price - 0.2 * atr_value
+            entry = current_price
             if swing_low > 0:
                 sl = swing_low - 0.1 * atr_value
                 if sl >= entry:
@@ -749,7 +757,7 @@ def calc_entry_sl_tp(
                 mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
                 sl = entry - mult * atr_value
         else:
-            entry = current_price + 0.2 * atr_value
+            entry = current_price
             if swing_high > 0:
                 sl = swing_high + 0.1 * atr_value
                 if sl <= entry:
@@ -917,7 +925,7 @@ def run_backtest_for_symbol(
         step_tf = "15m"       # Scan mỗi nến 15m
         df_fast_key = "15m"
         df_slow_key = "5m"
-        df_atr_key = "5m"
+        df_atr_key = "1h"     # ATR(1h) đủ lớn để cover fee; 5m quá nhỏ
         df_adx_key = "1h"
         df_trend_key = "4h"
         max_hold = MAX_HOLD_CANDLES_SCALP
@@ -1670,7 +1678,7 @@ Examples:
                         help="Momentum thanh bonus (+15 net_score) thay vi hard gate")
     # Params
     parser.add_argument("--confluence", type=int, default=3, help="Confluence threshold (default 3)")
-    parser.add_argument("--rr", type=float, default=1.5, help="Risk:Reward ratio")
+    parser.add_argument("--rr", type=float, default=2.0, help="Risk:Reward ratio")
     parser.add_argument("--net-score", dest="net_score", type=int, default=0,
                         help="Net score threshold LONG (0=auto: scalp=20, swing=10)")
     parser.add_argument("--strategy", default="", choices=["", "v1", "v2", "loose"],
