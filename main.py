@@ -19,6 +19,7 @@ from models import TradingSignal, SignalStatus, Trade, Direction, TradeStatus
 from agents.research_agent import ResearchAgent
 from agents.risk_manager import RiskManagerAgent
 from agents.executor_agent import ExecutorAgent
+from agents.smc_agent import SMCAgent
 from telegram_bot import TelegramNotifier
 
 
@@ -49,6 +50,7 @@ class TradingOrchestrator:
             on_approve_callback=self._on_user_approve,
         )
         self.research = ResearchAgent(self.db)
+        self.smc_agent = SMCAgent(self.db, telegram=self.telegram)
         self.scheduler = AsyncIOScheduler()
         self._running = False
         self._circuit_breaker_triggered = False
@@ -136,6 +138,16 @@ class TradingOrchestrator:
             misfire_grace_time=300,
             coalesce=True,
         )
+        # SMC standalone scan — chạy riêng, độc lập với research_scan
+        smc_interval_min = 5 if cfg.scan.trading_style == "scalp" else 15
+        self.scheduler.add_job(
+            self._smc_scan,
+            "interval",
+            minutes=smc_interval_min,
+            id="smc_scan",
+            misfire_grace_time=max(300, smc_interval_min * 60),
+            coalesce=True,
+        )
         self.scheduler.add_job(
             self._heartbeat,
             "interval",
@@ -164,6 +176,15 @@ class TradingOrchestrator:
         # Keep running
         while self._running:
             await asyncio.sleep(1)
+
+    async def _smc_scan(self):
+        """SMC standalone scan — chạy độc lập, song song với research_scan."""
+        try:
+            signals = await self.smc_agent.run_full_scan()
+            for signal in signals:
+                await self._process_signal(signal)
+        except Exception as e:
+            logger.error(f"SMC scan error: {e}")
 
     async def _scan_market(self):
         """Scan market và process signals"""
@@ -409,6 +430,7 @@ class TradingOrchestrator:
             self._circuit_breaker_triggered = False
             self._circuit_breaker_date = None
             self.scheduler.resume_job("market_scan")
+            self.scheduler.resume_job("smc_scan")
             logger.info("Circuit breaker: Resumed market scan (new day)")
             await self.telegram.send_message("✅ *Circuit breaker lifted* — New day, trading resumed.")
             return
@@ -418,6 +440,7 @@ class TradingOrchestrator:
                 self._circuit_breaker_triggered = False
                 self._circuit_breaker_date = None
                 self.scheduler.resume_job("market_scan")
+                self.scheduler.resume_job("smc_scan")
                 logger.info("Circuit breaker: Resumed market scan (PnL recovered)")
                 await self.telegram.send_message("✅ *Circuit breaker lifted* — Trading resumed.")
             return
@@ -427,6 +450,7 @@ class TradingOrchestrator:
                 self._circuit_breaker_triggered = True
                 self._circuit_breaker_date = today
                 self.scheduler.pause_job("market_scan")
+                self.scheduler.pause_job("smc_scan")
                 logger.warning(f"CIRCUIT BREAKER: Daily loss ${daily_pnl:.2f} exceeded limit ${-max_loss:.2f}")
                 await self.telegram.send_message(
                     f"🚨 *CIRCUIT BREAKER TRIGGERED*\n"
@@ -479,6 +503,7 @@ class TradingOrchestrator:
         self.scheduler.shutdown()
         # Web thread là daemon nên tự tắt khi main exit
         await self.research.close()
+        await self.smc_agent.close()
         await self.telegram.stop()
         self.db.close()
         logger.info("Trading Agent stopped")

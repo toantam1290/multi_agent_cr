@@ -79,6 +79,7 @@ class BacktestConfig:
     use_regime_filter: bool = True
     use_chop_filter: bool = True       # Chop Index > 61.8 → skip (scalp)
     use_smc_filter: bool = True        # SMC opposing + confluence + OB override
+    use_smc_standalone: bool = False   # True = chạy SMC standalone thay rule-based
     use_correlation_filter: bool = True # Tối đa 2 vị thế cùng hướng
     use_dynamic_confluence: bool = True # Win rate < 45% → min_confluence=4
     use_sl_structure: bool = True
@@ -121,6 +122,12 @@ class TradeResult:
     session: str
     hold_candles: int
     sl_trailing_state: str = "original"
+    # SMC standalone fields
+    entry_model: str = ""
+    entry_model_quality: str = ""
+    smc_htf_bias: str = ""
+    smc_ltf_trigger: str = ""
+    smc_confidence: int = 0
 
 
 @dataclass
@@ -272,9 +279,9 @@ async def download_all_data(
     end_ms = int(config.date_to.timestamp() * 1000)
 
     if config.style == "scalp":
-        intervals = ["5m", "15m", "1h", "4h"]
+        intervals = ["5m", "15m", "1h", "4h", "1d"]   # 1d cho PDH/PDL
     else:
-        intervals = ["1h", "4h", "1d"]
+        intervals = ["15m", "1h", "4h", "1d", "1w"]   # 1w cho PWH/PWL
 
     result = {}
     async with httpx.AsyncClient() as client:
@@ -1234,6 +1241,154 @@ def run_backtest_for_symbol(
     return trades
 
 
+# ─── SMC Standalone backtest ─────────────────────────────────────────────────
+
+def run_smc_backtest_for_symbol(
+    symbol: str,
+    data: dict[str, pd.DataFrame],
+    config: BacktestConfig,
+    date_from: datetime,
+    date_to: datetime,
+    verbose: bool = False,
+) -> list[TradeResult]:
+    """
+    Backtest SMC standalone — không dùng rule-based, CVD, VWAP, EMA9, regime, chop.
+    Chỉ SMCStrategy.analyze_from_dataframes() -> setup -> simulate_trade.
+    """
+    style = config.style
+    if style == "scalp":
+        step_tf = "15m"
+        df_htf_key, df_htf_timing_key = "1h", "15m"
+        df_ltf_key, df_ltf_timing_key = "15m", "5m"
+        df_daily_key = "1d"
+        max_hold = 12
+        future_tf = "5m"
+    else:
+        step_tf = "1h"
+        df_htf_key, df_htf_timing_key = "4h", "1h"
+        df_ltf_key, df_ltf_timing_key = "1h", "15m"
+        df_daily_key = "1d"
+        max_hold = MAX_HOLD_CANDLES_SWING
+        future_tf = "1h"
+
+    df_step = data.get(step_tf, pd.DataFrame())
+    df_future = data.get(future_tf, pd.DataFrame())
+
+    if df_step.empty:
+        print(f"  [WARN] No {step_tf} data for {symbol}")
+        return []
+
+    df_step_bt = df_step[(df_step.index >= date_from) & (df_step.index <= date_to)]
+    if df_step_bt.empty:
+        return []
+
+    from utils.smc_strategy import SMCStrategy
+    smc_strategy = SMCStrategy()
+
+    WARMUP = {"5m": 60, "15m": 160, "1h": 160, "4h": 160, "1d": 15}
+    trades = []
+    open_positions = []
+    total_steps = len(df_step_bt)
+    report_every = max(1, total_steps // 20)
+
+    for step_i, (step_ts, _) in enumerate(df_step_bt.iterrows()):
+        if verbose and step_i % report_every == 0:
+            pct = step_i / total_steps * 100
+            print(f"\r  {symbol} [SMC {style}] {pct:.0f}% ({step_ts.strftime('%Y-%m-%d')})", end="", flush=True)
+
+        def get_window(tf_key: str, n: int) -> pd.DataFrame:
+            df = data.get(tf_key, pd.DataFrame())
+            if df.empty:
+                return pd.DataFrame()
+            mask = df.index <= step_ts
+            available = df[mask]
+            # Min 30 rows (SMCAnalyzer requirement) — tránh bỏ sót data đầu backtest
+            return available.iloc[-n:] if len(available) >= 30 else pd.DataFrame()
+
+        df_htf = get_window(df_htf_key, WARMUP.get(df_htf_key, 150))
+        df_htf_timing = get_window(df_htf_timing_key, WARMUP.get(df_htf_timing_key, 150))
+        df_ltf = get_window(df_ltf_key, WARMUP.get(df_ltf_key, 150))
+        df_ltf_timing = get_window(df_ltf_timing_key, WARMUP.get(df_ltf_timing_key, 60))
+        df_d = get_window(df_daily_key, WARMUP.get(df_daily_key, 15)) if df_daily_key in data else None
+
+        if len(df_htf) < 30 or len(df_ltf) < 30 or df_ltf_timing.empty:
+            continue
+
+        current_price = float(df_ltf_timing["close"].iloc[-1])
+        if current_price <= 0:
+            continue
+
+        session = get_session(step_ts)
+        if config.use_session_filter and style == "scalp" and session not in ("london", "ny_overlap"):
+            continue
+
+        setup = smc_strategy.analyze_from_dataframes(
+            symbol=symbol,
+            df_htf_structure=df_htf,
+            df_htf_timing=df_htf_timing,
+            df_ltf_structure=df_ltf,
+            df_ltf_timing=df_ltf_timing,
+            current_price=current_price,
+            df_daily=df_d if df_d is not None and not df_d.empty else None,
+        )
+
+        if setup is None or not setup.valid:
+            continue
+
+        direction = setup.direction
+        entry, sl, tp = setup.entry, setup.sl, setup.tp1
+
+        open_positions = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
+        if sum(1 for p in open_positions if p.symbol == symbol) > 0:
+            continue
+        if len(open_positions) >= MAX_OPEN_POSITIONS:
+            continue
+
+        future_mask = df_future.index > step_ts
+        future_candles = df_future[future_mask].iloc[: max_hold * 2]
+        if len(future_candles) < 3:
+            continue
+
+        outcome, exit_price, pnl_pct, hold_candles, sl_state = simulate_trade(
+            direction, entry, sl, tp, future_candles,
+            use_trail_stop=config.use_trail_stop,
+            max_hold_candles=max_hold,
+        )
+
+        exit_ts = future_candles.index[hold_candles - 1] if hold_candles < len(future_candles) else future_candles.index[-1]
+        pnl_usdt = INITIAL_BALANCE * MAX_POSITION_PCT * pnl_pct / 100
+
+        trade = TradeResult(
+            symbol=symbol,
+            direction=direction,
+            entry_time=step_ts,
+            exit_time=exit_ts,
+            entry_price=entry,
+            sl=sl,
+            tp=tp,
+            exit_price=exit_price,
+            outcome=outcome,
+            pnl_pct=pnl_pct,
+            pnl_usdt=pnl_usdt,
+            confluence_score=0,
+            regime="smc",
+            session=session,
+            hold_candles=hold_candles,
+            sl_trailing_state=sl_state,
+            entry_model=setup.entry_model,
+            entry_model_quality=setup.entry_model_quality,
+            smc_htf_bias=setup.htf_bias,
+            smc_ltf_trigger=setup.ltf_trigger,
+            smc_confidence=setup.confidence,
+        )
+        trades.append(trade)
+        open_positions.append(trade)
+
+    if verbose:
+        print()
+    return trades
+
+
 # ─── Statistics calculation ───────────────────────────────────────────────────
 
 def calc_stats(trades: list[TradeResult], config: BacktestConfig, date_from: datetime, date_to: datetime) -> BacktestResult:
@@ -1686,6 +1841,50 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
         sign = "+" if pnl >= 0 else "-"
         print(f"  {month}: {sign}${abs(pnl):6.0f}  {bar}")
 
+    # SMC Standalone breakdown (khi có entry_model)
+    smc_trades = [t for t in trades if getattr(t, "entry_model", "")]
+    if smc_trades:
+        print(f"\n📐 SMC STANDALONE BREAKDOWN")
+        # By Entry Model
+        by_model: dict[str, list] = {}
+        for t in smc_trades:
+            m = t.entry_model or "unknown"
+            by_model.setdefault(m, []).append(t)
+        print(f"  By Entry Model:")
+        for m, lst in sorted(by_model.items()):
+            wins = sum(1 for x in lst if x.pnl_usdt > 0)
+            wr = wins / len(lst) * 100
+            avg_rr = 0.0
+            if lst:
+                wins_pct = [x.pnl_pct for x in lst if x.pnl_usdt > 0]
+                losses_pct = [abs(x.pnl_pct) for x in lst if x.pnl_usdt <= 0]
+                avg_win = sum(wins_pct) / len(wins_pct) if wins_pct else 0
+                avg_loss = sum(losses_pct) / len(losses_pct) if losses_pct else 1
+                avg_rr = avg_win / avg_loss if avg_loss > 0 else 0
+            print(f"    {m:<16}: {len(lst):3d} trades | WR {wr:.0f}% | Avg RR {avg_rr:.2f}")
+        # By Quality Grade
+        by_quality: dict[str, list] = {}
+        for t in smc_trades:
+            q = getattr(t, "entry_model_quality", "") or "?"
+            by_quality.setdefault(q, []).append(t)
+        print(f"  By Quality Grade:")
+        for q in ["A+", "A", "B", "C"]:
+            if q in by_quality:
+                lst = by_quality[q]
+                wins = sum(1 for x in lst if x.pnl_usdt > 0)
+                wr = wins / len(lst) * 100
+                print(f"    {q:<4}: {len(lst):3d} trades | WR {wr:.0f}%")
+        # By LTF Trigger
+        by_trigger: dict[str, list] = {}
+        for t in smc_trades:
+            tr = getattr(t, "smc_ltf_trigger", "") or "?"
+            by_trigger.setdefault(tr, []).append(t)
+        print(f"  By LTF Trigger:")
+        for tr, lst in sorted(by_trigger.items()):
+            wins = sum(1 for x in lst if x.pnl_usdt > 0)
+            wr = wins / len(lst) * 100
+            print(f"    {tr:<12}: WR {wr:.0f}% ({len(lst)} trades)")
+
     # Trail stop effectiveness
     trail_trades = [t for t in trades if t.sl_trailing_state != "original"]
     if trail_trades:
@@ -1748,6 +1947,8 @@ Examples:
     )
     parser.add_argument("--symbol", default="BTCUSDT", help="Comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
     parser.add_argument("--style", default="scalp", choices=["scalp", "swing"], help="Chỉ scalp được hỗ trợ đầy đủ")
+    parser.add_argument("--mode", default="rule", choices=["rule", "smc", "combined"],
+                        help="rule=rule-based (default) | smc=SMC standalone | combined=both")
     parser.add_argument("--from", dest="date_from", help="Start date YYYY-MM-DD")
     parser.add_argument("--to", dest="date_to", help="End date YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=180, help="Backtest last N days (override --from/--to)")
@@ -1822,12 +2023,14 @@ Examples:
 
     symbols = [s.strip().upper() for s in args.symbol.split(",")]
 
+    use_smc_standalone = args.mode in ("smc", "combined")
     config = BacktestConfig(
         symbols=symbols,
         style=args.style,
         date_from=date_from,
         date_to=date_to,
-        use_rule_filter=not args.no_rule,
+        use_smc_standalone=use_smc_standalone,
+        use_rule_filter=not args.no_rule if args.mode != "smc" else False,
         use_ema9_filter=not args.no_ema9,
         use_confluence_filter=not args.no_confluence,
         use_cvd_proxy=not args.no_cvd,
@@ -1851,7 +2054,7 @@ Examples:
         wf_test_days=args.wf_test,
     )
 
-    print(f"\n🔍 Backtest Engine — {args.style.upper()}")
+    print(f"\n🔍 Backtest Engine — {args.style.upper()} [mode={args.mode}]")
     print(f"   Symbols : {', '.join(symbols)}")
     print(f"   Period  : {date_from.strftime('%Y-%m-%d')} → {date_to.strftime('%Y-%m-%d')} ({(date_to-date_from).days} days)")
     print(f"   Filters : rule={config.use_rule_filter} ema9={config.use_ema9_filter} "
@@ -1917,8 +2120,21 @@ Examples:
                       f"{r['max_dd']:>6.1f}% {r['total_pnl_pct']:>+7.1f}%")
 
     else:
-        # Standard backtest (combined mode khi multi-symbol → correlation filter hoạt động)
-        if len(symbols) > 1:
+        # Standard backtest
+        if args.mode == "smc":
+            # SMC standalone only
+            all_trades = []
+            for symbol in symbols:
+                print(f"⏳ Running SMC backtest for {symbol}...")
+                trades = run_smc_backtest_for_symbol(
+                    symbol, all_data[symbol], config,
+                    date_from, date_to,
+                    verbose=args.verbose or args.funnel,
+                )
+                all_trades.extend(trades)
+                print(f"   -> {len(trades)} trades generated")
+        elif len(symbols) > 1:
+            # Combined mode khi multi-symbol
             print(f"⏳ Running combined backtest for {', '.join(symbols)}...")
             all_trades = run_backtest_combined(
                 symbols, all_data, config,
