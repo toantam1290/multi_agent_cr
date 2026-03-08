@@ -331,6 +331,7 @@ def compute_indicators(
     df_atr: pd.DataFrame,
     df_adx: pd.DataFrame,
     style: str,
+    step_ts: Optional["datetime"] = None,
 ) -> Optional[dict]:
     """
     Compute tất cả indicators từ rolling window DataFrames.
@@ -541,9 +542,18 @@ def compute_indicators(
     if chop_series is not None and not chop_series.empty and not pd.isna(chop_series.iloc[-1]):
         chop_index = float(chop_series.iloc[-1])
 
-    # VWAP (từ df_atr = 5m cho scalp)
+    # VWAP: reset mỗi ngày UTC (intraday VWAP thực, không phải VWMA 200 nến)
     vwap_val = vwap_distance_pct = 0.0
-    if len(df_atr) >= 20:
+    if step_ts is not None and len(df_atr) >= 3:
+        today_date = step_ts.date() if hasattr(step_ts, "date") else step_ts
+        df_today = df_atr[df_atr.index.date == today_date]
+        if len(df_today) >= 3 and df_today["volume"].sum() > 0:
+            typical = (df_today["high"] + df_today["low"] + df_today["close"]) / 3
+            vwap_val = float((typical * df_today["volume"]).sum() / df_today["volume"].sum())
+            if vwap_val > 0:
+                vwap_distance_pct = (current_price_val - vwap_val) / vwap_val * 100
+    elif len(df_atr) >= 20 and step_ts is None:
+        # Fallback khi không có step_ts (backward compat)
         typical = (df_atr["high"] + df_atr["low"] + df_atr["close"]) / 3
         vwap_val = float((typical * df_atr["volume"]).sum() / df_atr["volume"].sum()) if df_atr["volume"].sum() > 0 else 0.0
         if vwap_val > 0:
@@ -628,11 +638,11 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     """
     funding_pct = funding_rate * 100
     style = config.style
-    # Trend-following: LONG cần RSI > 50 (momentum up), SHORT cần RSI < 50
+    # Trend-following: LONG cần RSI 45-75, SHORT cần RSI 22-50 (nới cho loose)
     rsi_long_max = 78.0   # Hard ceiling tránh overbought extreme
-    rsi_long_min = 50.0   # Trend-following lower bound
+    rsi_long_min = 45.0   # Nới xuống 45 cho sideways + uptrend
     rsi_short_min = 22.0  # Hard floor tránh oversold extreme
-    rsi_short_max = 50.0  # Trend-following upper bound
+    rsi_short_max = 55.0  # Nới lên 55 cho sideways + downtrend
     if style != "scalp":
         rsi_long_max = config.scalp_rsi_long_max
         rsi_long_min = 35.0
@@ -659,7 +669,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     # LONG
     if rule_case != "short_only":
         long_ok = (
-            ind["trend_1d"] == "uptrend"
+            ind["trend_1d"] != "downtrend"
             and rsi_long_min < ind["rsi_1h"] < rsi_long_max
             and funding_pct < config.funding_long_max_pct
             and ind["net_score"] > net_long_min
@@ -675,7 +685,7 @@ def rule_based_filter(ind: dict, funding_rate: float, config: BacktestConfig) ->
     # SHORT
     if rule_case != "long_only":
         short_ok = (
-            ind["trend_1d"] == "downtrend"
+            ind["trend_1d"] != "uptrend"
             and rsi_short_min < ind["rsi_1h"] < rsi_short_max
             and funding_pct > 0.005
             and ind["net_score"] < net_short_max
@@ -704,24 +714,17 @@ def calc_confluence(ind: dict, direction: str, funding_rate: float, oi_change_pc
         score += 1
     if direction == "SHORT" and funding_rate > 0.0002:
         score += 1
-    # Whale net_flow proxy: dùng CVD ratio
-    if direction == "LONG" and ind["cvd_ratio"] > 0.5:
-        score += 1
-    if direction == "SHORT" and ind["cvd_ratio"] < 0.5:
+    # CVD: tối đa 1 điểm (gộp ratio + trend để tránh CVD chiếm 3/5 confluence)
+    cvd_ok = (
+        (direction == "LONG" and ind["cvd_ratio"] > 0.5 and ind["cvd_trend"] == "accelerating_buy")
+        or (direction == "SHORT" and ind["cvd_ratio"] < 0.5 and ind["cvd_trend"] == "accelerating_sell")
+    )
+    if cvd_ok:
         score += 1
     if oi_change_pct > 5 and (
         (direction == "LONG" and ind["trend_1d"] == "uptrend")
         or (direction == "SHORT" and ind["trend_1d"] == "downtrend")
     ):
-        score += 1
-    # CVD order flow
-    if direction == "LONG" and ind["cvd_ratio"] > 0.55:
-        score += 1
-    if direction == "SHORT" and ind["cvd_ratio"] < 0.45:
-        score += 1
-    if direction == "LONG" and ind["cvd_trend"] == "accelerating_buy":
-        score += 1
-    if direction == "SHORT" and ind["cvd_trend"] == "accelerating_sell":
         score += 1
     # VWAP
     if direction == "LONG" and -0.5 <= ind["vwap_distance_pct"] <= 0:
@@ -744,29 +747,14 @@ def calc_entry_sl_tp(
     swing_high: float = 0.0,
 ) -> Optional[tuple[float, float, float]]:
     if style == "scalp":
+        # Scalp: ATR-only SL (bỏ swing structure — 1h swing 10 nến mismatch với scalp timeframe)
         rr = rr_ratio
+        entry = current_price
+        mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
         if direction == "LONG":
-            entry = current_price
-            if swing_low > 0:
-                sl = swing_low - 0.1 * atr_value
-                if sl >= entry:
-                    return None
-                if entry - sl > 2.0 * atr_value:
-                    return None
-            else:
-                mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
-                sl = entry - mult * atr_value
+            sl = entry - mult * atr_value
         else:
-            entry = current_price
-            if swing_high > 0:
-                sl = swing_high + 0.1 * atr_value
-                if sl <= entry:
-                    return None
-                if sl - entry > 2.0 * atr_value:
-                    return None
-            else:
-                mult = 1.2 if regime == "trending_volatile" else (1.0 if regime in ("trending_up", "trending_down") else 0.8)
-                sl = entry + mult * atr_value
+            sl = entry + mult * atr_value
         tp = entry + rr * (entry - sl) if direction == "LONG" else entry - rr * (sl - entry)
     else:
         mult = 1.5 if regime in ("trending_up", "trending_down") else 1.2
@@ -998,7 +986,7 @@ def run_backtest_for_symbol(
         open_positions = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
 
         # ── Compute indicators ─────────────────────────────────────────────
-        ind = compute_indicators(df_fast, df_slow, df_trend, df_atr, df_adx, style)
+        ind = compute_indicators(df_fast, df_slow, df_trend, df_atr, df_adx, style, step_ts=step_ts)
         if ind is None:
             continue
 
@@ -1311,7 +1299,7 @@ def run_backtest_combined(
             if df_fast.empty or df_slow.empty or df_trend.empty:
                 continue
 
-            ind = compute_indicators(df_fast, df_slow, df_trend, df_atr, df_adx, style)
+            ind = compute_indicators(df_fast, df_slow, df_trend, df_atr, df_adx, style, step_ts=step_ts)
             if ind is None or ind["current_price"] <= 0:
                 continue
 
