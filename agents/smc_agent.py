@@ -20,7 +20,7 @@ from loguru import logger
 from config import cfg, ALLOWED_PAIRS, get_effective_min_confidence
 from database import Database
 from models import TradingSignal, Direction, SignalStatus, TechnicalSignal, WhaleSignal, SentimentSignal
-from utils.market_data import BinanceDataFetcher
+from utils.market_data import BinanceDataFetcher, FearGreedFetcher
 from utils.smc_strategy import SMCStrategy, SMCSetup
 from utils.crypto_confluence import interpret_funding, interpret_oi, interpret_cvd
 
@@ -35,6 +35,7 @@ class SMCAgent:
         self.db = db
         self.telegram = telegram
         self.binance = BinanceDataFetcher()
+        self.fear_greed = FearGreedFetcher()
         self.strategy = SMCStrategy(self.binance)
 
         self._pair_semaphore = asyncio.Semaphore(3)
@@ -48,18 +49,28 @@ class SMCAgent:
             try:
                 style = cfg.scan.trading_style or "scalp"
 
-                # Fetch SMC + derivatives + CVD song song (futures cho khớp với funding/OI)
+                # Fetch SMC + derivatives + CVD + F&G song song (futures cho khớp với funding/OI)
                 setup_task = self.strategy.analyze(symbol, style=style)
                 deriv_task = self.binance.get_derivatives_signal(symbol)
                 cvd_task = self.binance.get_cvd_signal(symbol, limit=500, use_futures=True)
                 stats_task = self.binance.get_24h_stats(symbol, use_futures=True)
+                fg_task = self.fear_greed.get()
 
-                setup, deriv, cvd_data, stats_24h = await asyncio.gather(
-                    setup_task, deriv_task, cvd_task, stats_task,
+                setup, deriv, cvd_data, stats_24h, sentiment = await asyncio.gather(
+                    setup_task, deriv_task, cvd_task, stats_task, fg_task,
                     return_exceptions=True,
                 )
 
                 if isinstance(setup, Exception) or setup is None or not setup.valid:
+                    return None
+
+                if isinstance(sentiment, Exception):
+                    sentiment = SentimentSignal(fear_greed_index=50, fear_greed_label="Neutral")
+                fg = sentiment.fear_greed_index if hasattr(sentiment, "fear_greed_index") else 50
+
+                # Pair cooldown — tránh duplicate signal cùng pair trong 30 phút
+                if self.db.had_recent_signal_for_pair(symbol, cooldown_sec=1800):
+                    logger.info(f"SMCAgent {symbol}: Cooldown active (< 30m since last signal), skip")
                     return None
 
                 if isinstance(deriv, Exception):
@@ -110,6 +121,15 @@ class SMCAgent:
                 setup.confidence = confidence
                 if confluence_notes:
                     setup.reasoning += " | Confluence: " + " | ".join(confluence_notes)
+
+                # F&G extreme — block LONG khi Extreme Fear, block SHORT khi Extreme Greed
+                if style == "scalp":
+                    if setup.direction == "LONG" and fg < 25:
+                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Fear) → skip LONG scalp")
+                        return None
+                    if setup.direction == "SHORT" and fg > 75:
+                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Greed) → skip SHORT scalp")
+                        return None
 
                 available = await self._get_available_balance()
                 position_size = min(
@@ -269,3 +289,4 @@ class SMCAgent:
 
     async def close(self):
         await self.binance.close()
+        await self.fear_greed.close()

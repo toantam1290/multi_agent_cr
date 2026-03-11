@@ -39,6 +39,7 @@ class OrderBlock:
     candle_index: int
     strength_pct: float
     mitigated: bool = False   # True = giá đã quay lại và phá qua OB
+    has_fvg_overlap: bool = False  # OB overlap với unmitigated FVG = Propulsion Block
 
 
 @dataclass
@@ -244,6 +245,18 @@ class SMCAnalyzer:
 
         # FVG với CE, BPR, Inversion
         bull_fvgs, bear_fvgs = self._detect_fvg(df_structure, current_price)
+
+        # FVG+OB confluence: OB overlap với unmitigated FVG = Propulsion Block
+        for ob in bull_obs:
+            for fvg in bull_fvgs:
+                if not fvg.filled and ob.price_low < fvg.top and ob.price_high > fvg.bottom:
+                    ob.has_fvg_overlap = True
+                    break
+        for ob in bear_obs:
+            for fvg in bear_fvgs:
+                if not fvg.filled and ob.price_low < fvg.top and ob.price_high > fvg.bottom:
+                    ob.has_fvg_overlap = True
+                    break
 
         # BPR check
         has_bpr, bpr_top, bpr_bottom = self._detect_bpr(bull_fvgs, bear_fvgs)

@@ -3,6 +3,7 @@ config.py - Tất cả config tập trung một chỗ
 """
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -193,5 +194,6 @@ ANALYSIS_INTERVALS = ["15m", "1h", "4h", "1d"]
 # Whale threshold (USD)
 WHALE_MIN_USD = 1_000_000
 
-# Database
-DB_PATH = "data/trading.db"
+# Database — dùng absolute path để Web UI + scripts luôn trỏ đúng DB
+_config_dir = Path(__file__).resolve().parent
+DB_PATH = str(_config_dir / "data" / "trading.db")

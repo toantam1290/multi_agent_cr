@@ -98,6 +98,21 @@ class BacktestConfig:
     funding_long_max_pct: float = 0.05
     # Rule cases: full | long_only | short_only | no_volume | no_momentum
     rule_case: str = "full"
+    # SMC standalone tunable (khi use_smc_standalone=True)
+    smc_min_rr_tp1: float = 1.8      # Min R:R TP1 — tăng lọc setup chất lượng (was 1.5)
+    smc_min_confidence: int = 55     # Min confidence — tăng filter (was 50)
+    smc_sl_buffer_pct: float = 0.003  # SL buffer 0.3% — tránh wick hit (was 0.2%)
+    smc_ob_entry_only: bool = False   # Chỉ trade ob_entry, bỏ ce/sweep/bpr
+    smc_disable_ce_entry: bool = False  # Bỏ ce_entry (WR thấp ~23%)
+    smc_min_grade: str = ""           # Chỉ grade A+ hoặc A: "A" | "" = không filter
+    smc_displacement_only: bool = False  # Chỉ ltf_trigger=displacement, bỏ sweep/choch
+    smc_chop_threshold: float = 61.8   # Chop > threshold = skip (strict: 50)
+    # SMC standalone extra filters (nhẹ, không gây 0 trades)
+    smc_use_chop_filter: bool = True   # Chop > threshold = choppy, skip
+    smc_use_funding_filter: bool = True  # LONG khi funding <= 0, SHORT khi funding >= 0
+    smc_use_adx_filter: bool = False  # ADX > min = trending only (default off)
+    smc_adx_min: float = 20.0
+    smc_breakeven_candles: int = 0     # 0=off; >0: sau N candles move SL lên entry
     # Walk-forward
     walk_forward: bool = False
     wf_train_days: int = 120
@@ -801,6 +816,7 @@ def simulate_trade(
     future_df: pd.DataFrame,
     use_trail_stop: bool = True,
     max_hold_candles: int = MAX_HOLD_CANDLES_SCALP,
+    breakeven_candles: int = 0,
 ) -> tuple[str, float, float, int, str]:
     """
     Simulate trade outcome bằng cách replay từng candle tương lai.
@@ -829,6 +845,13 @@ def simulate_trade(
             pnl_pct = _calc_pnl(direction, entry, exit_price)
             return "TIME_EXIT", exit_price, pnl_pct, i, sl_state
 
+        # Break-even move: sau N candles move SL lên entry
+        if breakeven_candles > 0 and i >= breakeven_candles:
+            if direction == "LONG" and current_sl < entry:
+                current_sl = entry
+            elif direction == "SHORT" and current_sl > entry:
+                current_sl = entry
+
         low = float(candle["low"])
         high = float(candle["high"])
 
@@ -853,7 +876,7 @@ def simulate_trade(
                    (direction == "SHORT" and new_sl < current_sl):
                     current_sl = new_sl
                     sl_state = "locked_50"
-            elif unrealized_pct >= target_pct * 0.5 and sl_state == "original":
+            elif unrealized_pct >= target_pct * 0.35 and sl_state == "original":
                 new_sl = entry * 1.001 if direction == "LONG" else entry * 0.999
                 if (direction == "LONG" and new_sl > current_sl) or \
                    (direction == "SHORT" and new_sl < current_sl):
@@ -1283,7 +1306,11 @@ def run_smc_backtest_for_symbol(
         return []
 
     from utils.smc_strategy import SMCStrategy
-    smc_strategy = SMCStrategy()
+    smc_strategy = SMCStrategy(
+        min_rr_tp1=config.smc_min_rr_tp1,
+        min_confidence=config.smc_min_confidence,
+        sl_buffer_pct=config.smc_sl_buffer_pct,
+    )
 
     WARMUP = {"5m": 60, "15m": 160, "1h": 160, "4h": 160, "1d": 15}
     trades = []
@@ -1319,8 +1346,11 @@ def run_smc_backtest_for_symbol(
             continue
 
         session = get_session(step_ts)
-        if config.use_session_filter and style == "scalp" and session not in ("london", "ny_overlap"):
-            continue
+        if config.use_session_filter:
+            if style == "scalp" and session not in ("london", "ny_overlap"):
+                continue
+            if style == "swing" and session == "asia":
+                continue
 
         setup = smc_strategy.analyze_from_dataframes(
             symbol=symbol,
@@ -1334,9 +1364,38 @@ def run_smc_backtest_for_symbol(
 
         if setup is None or not setup.valid:
             continue
+        if config.smc_ob_entry_only and setup.entry_model != "ob_entry":
+            continue
+        if config.smc_disable_ce_entry and setup.entry_model == "ce_entry":
+            continue
+        if config.smc_min_grade and setup.entry_model_quality not in ("A+", "A"):
+            continue
+        if config.smc_displacement_only and setup.ltf_trigger != "displacement":
+            continue
 
         direction = setup.direction
         entry, sl, tp = setup.entry, setup.sl, setup.tp1
+
+        # SMC standalone extra filters (nhẹ)
+        if config.smc_use_chop_filter and style == "scalp" and len(df_ltf) >= 14:
+            chop_series = ta.chop(df_ltf["high"], df_ltf["low"], df_ltf["close"], length=14, atr_length=1)
+            if chop_series is not None and not chop_series.empty and not pd.isna(chop_series.iloc[-1]):
+                if float(chop_series.iloc[-1]) > config.smc_chop_threshold:
+                    continue
+        if config.smc_use_adx_filter and len(df_htf) >= 14:
+            adx_df = ta.adx(df_htf["high"], df_htf["low"], df_htf["close"], length=14)
+            if adx_df is not None and not adx_df.empty:
+                adx_col = "ADX_14" if "ADX_14" in adx_df.columns else adx_df.columns[0]
+                adx_val = float(adx_df[adx_col].iloc[-1])
+                if not pd.isna(adx_val) and adx_val < config.smc_adx_min:
+                    continue
+        if config.smc_use_funding_filter:
+            funding_df = data.get("funding", pd.DataFrame())
+            funding_rate = get_funding_at(funding_df, step_ts)
+            if direction == "LONG" and funding_rate > 0.0005:
+                continue
+            if direction == "SHORT" and funding_rate < -0.0005:
+                continue
 
         open_positions = [p for p in open_positions if p.exit_time is None or p.exit_time > step_ts]
         if sum(1 for p in open_positions if p.symbol == symbol) > 0:
@@ -1353,6 +1412,7 @@ def run_smc_backtest_for_symbol(
             direction, entry, sl, tp, future_candles,
             use_trail_stop=config.use_trail_stop,
             max_hold_candles=max_hold,
+            breakeven_candles=config.smc_breakeven_candles,
         )
 
         exit_ts = future_candles.index[hold_candles - 1] if hold_candles < len(future_candles) else future_candles.index[-1]
@@ -1761,16 +1821,16 @@ def run_optimization(
 def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_to: datetime):
     trades = result.trades
     print(f"\n{'='*65}")
-    print(f"  BACKTEST REPORT — {symbol} [{result.config.style.upper()}]")
-    print(f"  {date_from.strftime('%Y-%m-%d')} → {date_to.strftime('%Y-%m-%d')}")
+    print(f"  BACKTEST REPORT - {symbol} [{result.config.style.upper()}]")
+    print(f"  {date_from.strftime('%Y-%m-%d')} -> {date_to.strftime('%Y-%m-%d')}")
     print(f"{'='*65}")
 
     if not trades:
-        print("  ⚠️  Không có trade nào trong khoảng thời gian này.")
-        print("  → Filter quá chặt, thử dùng --relax hoặc rút ngắn thời gian")
+        print("  [WARN] Khong co trade nao trong khoang thoi gian nay.")
+        print("  -> Filter too tight, try --relax or shorter period")
         return
 
-    print(f"\n📊 PERFORMANCE SUMMARY")
+    print(f"\n[PERFORMANCE SUMMARY]")
     print(f"  Initial balance    : ${INITIAL_BALANCE:,.0f} USDT")
     print(f"  Position size      : {MAX_POSITION_PCT*100:.0f}% = ${INITIAL_BALANCE*MAX_POSITION_PCT:,.0f} per trade")
     print(f"  Total trades       : {len(trades)}")
@@ -1788,14 +1848,14 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
     outcomes = {}
     for t in trades:
         outcomes[t.outcome] = outcomes.get(t.outcome, 0) + 1
-    print(f"\n📋 OUTCOME BREAKDOWN")
+    print(f"\n[OUTCOME BREAKDOWN]")
     for outcome, count in sorted(outcomes.items()):
         pct = count / len(trades) * 100
         print(f"  {outcome:<12}: {count:4d} ({pct:.1f}%)")
 
     # Breakdown by session
     if result.config.style == "scalp":
-        print(f"\n🕐 BY SESSION")
+        print(f"\n[BY SESSION]")
         for sess in ["london", "ny_overlap", "asia", "dead_zone"]:
             sess_trades = [t for t in trades if t.session == sess]
             if not sess_trades:
@@ -1805,7 +1865,7 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
                   f"win={len(sess_wins)/len(sess_trades)*100:.1f}%")
 
     # Breakdown by regime
-    print(f"\n📈 BY REGIME")
+    print(f"\n[BY REGIME]")
     regimes = {}
     for t in trades:
         if t.regime not in regimes:
@@ -1818,7 +1878,7 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
         print(f"  {r:<20}: {len(v['trades']):4d} trades, win={wr:.1f}%")
 
     # Breakdown by direction
-    print(f"\n↕️  BY DIRECTION")
+    print(f"\n[BY DIRECTION]")
     for direction in ["LONG", "SHORT"]:
         dir_trades = [t for t in trades if t.direction == direction]
         if not dir_trades:
@@ -1830,21 +1890,21 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
               f"avg_pnl={avg_pnl:+.2f}%")
 
     # Monthly breakdown
-    print(f"\n📅 MONTHLY PNL")
+    print(f"\n[MONTHLY PNL]")
     monthly: dict[str, float] = {}
     for t in trades:
         month = t.entry_time.strftime("%Y-%m")
         monthly[month] = monthly.get(month, 0) + t.pnl_usdt
     for month, pnl in sorted(monthly.items()):
         bar_len = int(abs(pnl) / 20)
-        bar = "█" * min(bar_len, 30)
+        bar = "#" * min(bar_len, 30)
         sign = "+" if pnl >= 0 else "-"
         print(f"  {month}: {sign}${abs(pnl):6.0f}  {bar}")
 
     # SMC Standalone breakdown (khi có entry_model)
     smc_trades = [t for t in trades if getattr(t, "entry_model", "")]
     if smc_trades:
-        print(f"\n📐 SMC STANDALONE BREAKDOWN")
+        print(f"\n[SMC STANDALONE BREAKDOWN]")
         # By Entry Model
         by_model: dict[str, list] = {}
         for t in smc_trades:
@@ -1888,30 +1948,30 @@ def print_report(result: BacktestResult, symbol: str, date_from: datetime, date_
     # Trail stop effectiveness
     trail_trades = [t for t in trades if t.sl_trailing_state != "original"]
     if trail_trades:
-        print(f"\n🎯 TRAIL STOP")
+        print(f"\n[TRAIL STOP]")
         print(f"  Activated          : {len(trail_trades)}/{len(trades)} ({len(trail_trades)/len(trades)*100:.1f}%)")
         trail_wins = [t for t in trail_trades if t.pnl_usdt > 0]
         print(f"  Win rate (trailed) : {len(trail_wins)/len(trail_trades)*100:.1f}%")
 
     # Top 5 best / worst trades
     sorted_trades = sorted(trades, key=lambda x: x.pnl_pct, reverse=True)
-    print(f"\n🏆 BEST 5 TRADES")
+    print(f"\n[BEST 5 TRADES]")
     for t in sorted_trades[:5]:
         print(f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} {t.direction:<5} {t.symbol} "
-              f"entry={t.entry_price:.4f} → {t.outcome} {t.pnl_pct:+.2f}%")
-    print(f"\n💀 WORST 5 TRADES")
+              f"entry={t.entry_price:.4f} -> {t.outcome} {t.pnl_pct:+.2f}%")
+    print(f"\n[WORST 5 TRADES]")
     for t in sorted_trades[-5:]:
         print(f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} {t.direction:<5} {t.symbol} "
-              f"entry={t.entry_price:.4f} → {t.outcome} {t.pnl_pct:+.2f}%")
+              f"entry={t.entry_price:.4f} -> {t.outcome} {t.pnl_pct:+.2f}%")
 
     # Assessment
     print(f"\n{'='*65}")
     if result.win_rate >= 55 and result.profit_factor >= 1.5:
-        verdict = "✅ EDGE CÓ THỂ TRADE — win rate và PF đều đạt ngưỡng tối thiểu"
+        verdict = "EDGE - co the trade"
     elif result.win_rate >= 50 and result.profit_factor >= 1.2:
-        verdict = "⚠️  MARGINAL — cần tối ưu thêm trước khi live"
+        verdict = "MARGINAL - can toi uu them"
     else:
-        verdict = "❌ NO EDGE — không nên trade với params này"
+        verdict = "NO EDGE - khong nen trade"
     print(f"  VERDICT: {verdict}")
     print(f"  (Min target: win_rate>=55%, profit_factor>=1.5)")
     print(f"{'='*65}\n")
@@ -2054,9 +2114,9 @@ Examples:
         wf_test_days=args.wf_test,
     )
 
-    print(f"\n🔍 Backtest Engine — {args.style.upper()} [mode={args.mode}]")
+    print(f"\n[Backtest Engine] {args.style.upper()} [mode={args.mode}]")
     print(f"   Symbols : {', '.join(symbols)}")
-    print(f"   Period  : {date_from.strftime('%Y-%m-%d')} → {date_to.strftime('%Y-%m-%d')} ({(date_to-date_from).days} days)")
+    print(f"   Period  : {date_from.strftime('%Y-%m-%d')} -> {date_to.strftime('%Y-%m-%d')} ({(date_to-date_from).days} days)")
     print(f"   Filters : rule={config.use_rule_filter} ema9={config.use_ema9_filter} "
           f"conf={config.use_confluence_filter}(>={config.confluence_threshold}) "
           f"cvd={config.use_cvd_proxy} vwap={config.use_vwap_filter} "
@@ -2067,7 +2127,7 @@ Examples:
     print()
 
     # Download data
-    print("📥 Data...")
+    print("[Data...]")
     all_data = await download_all_data(config, use_cache=args.use_cache, download_only=args.download_only)
 
     if args.download_only:
@@ -2075,7 +2135,7 @@ Examples:
         return
 
     if args.rule_cases:
-        print("\n📋 Rule cases comparison (scalp)...")
+        print("\n[Rule cases comparison (scalp)...]")
         for rule_case in ["full", "long_only", "short_only", "no_volume", "no_momentum"]:
             cfg = replace(config, rule_case=rule_case)
             trades = run_backtest_for_symbol(symbols[0], all_data[symbols[0]], cfg, date_from, date_to)
@@ -2084,7 +2144,7 @@ Examples:
         return
 
     if args.walk_forward:
-        print(f"\n🔄 Walk-forward analysis (train={args.wf_train}d, test={args.wf_test}d)")
+        print(f"\n[Walk-forward analysis] (train={args.wf_train}d, test={args.wf_test}d)")
         for symbol in symbols:
             windows = run_walk_forward(symbol, all_data[symbol], config)
             print(f"\n  {symbol} Walk-forward results:")
@@ -2108,7 +2168,7 @@ Examples:
                 print(f"  Avg OOS win rate: {avg_oos_wr:.1f}%")
 
     elif args.optimize:
-        print(f"\n⚙️  Parameter optimization (warning: in-sample only)")
+        print(f"\n[Parameter optimization] (warning: in-sample only)")
         for symbol in symbols:
             print(f"\n  {symbol} optimization:")
             results = run_optimization(symbol, all_data[symbol], config)
@@ -2125,7 +2185,7 @@ Examples:
             # SMC standalone only
             all_trades = []
             for symbol in symbols:
-                print(f"⏳ Running SMC backtest for {symbol}...")
+                print(f"[Running SMC backtest for {symbol}...]")
                 trades = run_smc_backtest_for_symbol(
                     symbol, all_data[symbol], config,
                     date_from, date_to,
@@ -2135,27 +2195,27 @@ Examples:
                 print(f"   -> {len(trades)} trades generated")
         elif len(symbols) > 1:
             # Combined mode khi multi-symbol
-            print(f"⏳ Running combined backtest for {', '.join(symbols)}...")
+            print(f"[Running combined backtest for {', '.join(symbols)}...]")
             all_trades = run_backtest_combined(
                 symbols, all_data, config,
                 date_from, date_to,
                 verbose=args.verbose or args.funnel,
             )
-            print(f"   → {len(all_trades)} trades generated")
+            print(f"   -> {len(all_trades)} trades generated")
         else:
             all_trades = []
             for symbol in symbols:
-                print(f"⏳ Running backtest for {symbol}...")
+                print(f"[Running backtest for {symbol}...]")
                 trades = run_backtest_for_symbol(
                     symbol, all_data[symbol], config,
                     date_from, date_to,
                     verbose=args.verbose or args.funnel,
                 )
                 all_trades.extend(trades)
-                print(f"   → {len(trades)} trades generated")
+                print(f"   -> {len(trades)} trades generated")
 
         if len(symbols) > 1:
-            print(f"\n📊 COMBINED RESULTS ({len(symbols)} symbols, {len(all_trades)} total trades)")
+            print(f"\n[COMBINED RESULTS] ({len(symbols)} symbols, {len(all_trades)} total trades)")
 
         result = calc_stats(all_trades, config, date_from, date_to)
         symbol_label = "+".join(symbols) if len(symbols) > 1 else symbols[0]

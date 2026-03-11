@@ -4,7 +4,7 @@ database.py - SQLite local database để lưu signals, trades, logs
 import json
 import sqlite3
 import threading
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 from loguru import logger
@@ -263,6 +263,15 @@ class Database:
             "SELECT raw_json FROM signals ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [json.loads(r["raw_json"]) for r in rows]
+
+    def had_recent_signal_for_pair(self, pair: str, cooldown_sec: int = 1800) -> bool:
+        """Check if we had any signal for this pair in the last cooldown_sec seconds."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=cooldown_sec)).isoformat()
+        row = self.conn.execute(
+            "SELECT 1 FROM signals WHERE pair = ? AND created_at > ? LIMIT 1",
+            (pair, cutoff),
+        ).fetchone()
+        return row is not None
 
     # ─── Trades ─────────────────────────────────────────────────────────────
 

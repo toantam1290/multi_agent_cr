@@ -240,13 +240,25 @@ class ResearchAgent:
 
             meta["rule_passed"] = True
 
+            # 2a-pre. Scalp: F&G extreme — block LONG khi Extreme Fear, block SHORT khi Extreme Greed
+            if style == "scalp" and not relax:
+                fg = sentiment.fear_greed_index
+                if direction == "LONG" and fg < 25:
+                    logger.info(f"{pair}: F&G={fg} (Extreme Fear) → skip LONG scalp")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme", {"fg": fg})
+                    return None, meta
+                if direction == "SHORT" and fg > 75:
+                    logger.info(f"{pair}: F&G={fg} (Extreme Greed) → skip SHORT scalp")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme", {"fg": fg})
+                    return None, meta
+
             # 2a. Scalp: CVD divergence — giá bullish nhưng seller đang dominate = fake move
             if style == "scalp" and not relax:
-                if direction == "LONG" and cvd["cvd_ratio"] < 0.45:
+                if direction == "LONG" and cvd["cvd_ratio"] < 0.52:
                     logger.info(f"{pair}: CVD divergence — price bullish but sellers dominating ({cvd['cvd_ratio']:.2f}), skip")
                     self.db.log("research_agent", "INFO", f"Skip {pair}: CVD divergence", {"pair": pair, "cvd_ratio": cvd["cvd_ratio"]})
                     return None, meta
-                if direction == "SHORT" and cvd["cvd_ratio"] > 0.55:
+                if direction == "SHORT" and cvd["cvd_ratio"] > 0.48:
                     logger.info(f"{pair}: CVD divergence — price bearish but buyers dominating ({cvd['cvd_ratio']:.2f}), skip")
                     self.db.log("research_agent", "INFO", f"Skip {pair}: CVD divergence", {"pair": pair, "cvd_ratio": cvd["cvd_ratio"]})
                     return None, meta
@@ -316,6 +328,10 @@ class ResearchAgent:
                 return None, meta
 
             # 3b. Confluence check — ít nhất 3/6 yếu tố align trước khi gọi Claude (RELAX: bỏ qua)
+            fg = sentiment.fear_greed_index
+            effective_min_conf = min_confluence
+            if not relax and style == "scalp" and (fg < 25 or fg > 75):
+                effective_min_conf = 4  # Extreme market cần thêm 1 yếu tố
             confluence_score = 0
             if direction == "LONG" and technical.trend_1d == "uptrend":
                 confluence_score += 1
@@ -366,10 +382,10 @@ class ResearchAgent:
                     confluence_score += 2
                 elif direction == "SHORT" and smc_signal.smc_score <= -50:
                     confluence_score += 2
-            if not relax and confluence_score < min_confluence:
+            if not relax and confluence_score < effective_min_conf:
                 meta["confluence_rejected"] = True
-                logger.info(f"{pair}: Confluence {confluence_score}/9 < {min_confluence}, skip Claude")
-                self.db.log("research_agent", "INFO", f"Confluence low {pair}", {"pair": pair, "score": confluence_score})
+                logger.info(f"{pair}: Confluence {confluence_score}/9 < {effective_min_conf}, skip Claude")
+                self.db.log("research_agent", "INFO", f"Confluence low {pair}", {"pair": pair, "score": confluence_score, "min": effective_min_conf})
                 return None, meta
 
             # 4. Position size check TRƯỚC Claude (tránh lãng phí budget khi available=0)
@@ -380,6 +396,12 @@ class ResearchAgent:
             )
             if position_size < 10:
                 logger.info(f"{pair}: Position size too small (${position_size:.2f}), skipping (pre-Claude)")
+                return None, meta
+
+            # 4b. Pair cooldown — tránh duplicate signal cùng pair trong 30 phút
+            if self.db.had_recent_signal_for_pair(pair, cooldown_sec=1800):
+                logger.info(f"{pair}: Cooldown active (< 30m since last signal), skip")
+                self.db.log("research_agent", "INFO", f"Skip {pair}: cooldown", {"pair": pair})
                 return None, meta
 
             # 5. Calc entry/SL/TP (rule-based, ATR hoặc swing structure)
