@@ -83,24 +83,24 @@ class SMCAgent:
                 base_confidence = setup.confidence
                 confidence = base_confidence
                 confluence_notes = []
-                mults = []
+                adjustments = []
                 weights = []
 
                 # Lớp 1: Funding Rate (chỉ khi fetch OK — tránh magic number)
                 if deriv and deriv.fetch_ok:
-                    fr_mult, fr_note = interpret_funding(deriv.funding_rate, setup.direction)
-                    mults.append(fr_mult)
+                    fr_adj, fr_note = interpret_funding(deriv.funding_rate, setup.direction)
+                    adjustments.append(fr_adj)
                     weights.append(0.4)
                     confluence_notes.append(fr_note)
 
                 # Lớp 2: Open Interest (cần deriv.fetch_ok — OI từ cùng API)
                 if deriv and deriv.fetch_ok and stats_24h and deriv.oi_change_pct != 0:
-                    oi_mult, oi_note = interpret_oi(
+                    oi_adj, oi_note = interpret_oi(
                         deriv.oi_change_pct,
                         stats_24h.get("price_change_pct", 0),
                         setup.direction,
                     )
-                    mults.append(oi_mult)
+                    adjustments.append(oi_adj)
                     weights.append(0.3)
                     confluence_notes.append(oi_note)
 
@@ -109,16 +109,17 @@ class SMCAgent:
                     ltf = setup.ltf_signal
                     in_ob = ltf.price_in_ob if ltf else False
                     in_fvg = ltf.price_in_fvg if ltf else False
-                    cvd_mult, cvd_note = interpret_cvd(cvd_data, setup.direction, in_ob, in_fvg)
-                    mults.append(cvd_mult)
+                    cvd_adj, cvd_note = interpret_cvd(cvd_data, setup.direction, in_ob, in_fvg)
+                    adjustments.append(cvd_adj)
                     weights.append(0.3)
                     confluence_notes.append(cvd_note)
 
-                # Weighted average thay vì nhân liên tiếp — tránh cascade collapse
-                if mults:
+                # Weighted average of point adjustments — additive, not multiplicative
+                if adjustments:
                     total_w = sum(weights)
-                    combined_mult = sum(m * w for m, w in zip(mults, weights)) / total_w
-                    confidence = int(confidence * combined_mult)
+                    raw_adj = sum(a * w for a, w in zip(adjustments, weights)) / total_w
+                    capped_adj = max(-15, min(15, raw_adj))
+                    confidence = int(confidence + capped_adj)
 
                 confidence = max(0, min(100, confidence))
                 min_conf = get_effective_min_confidence()
@@ -226,6 +227,8 @@ class SMCAgent:
                 "draw_on_liquidity": setup.draw_on_liquidity,
                 "tp2": setup.tp2,
                 "risk_reward_tp2": setup.risk_reward_tp2,
+                "ob_zone_low": getattr(setup, 'ob_zone_low', None),
+                "ob_zone_high": getattr(setup, 'ob_zone_high', None),
                 "reasoning": setup.reasoning,
                 "summary": (
                     setup.ltf_signal.summary[:200]

@@ -98,6 +98,8 @@ TradingSignal (thêm field smc=dict)
 - `LiquidityLevel`: price, side, touches, swept
 - `SMCSignal`: bias, last_structure_event, nearest OB/FVG, liquidity, smc_score, summary
 
+> **Phase 1 update:** `SMCSetup` (từ doc 025) thêm fields `ob_zone_low` / `ob_zone_high` cho OB zone fill. Entry cascade giờ là `ob_entry → sweep_reversal → bpr_entry` (`ce_entry` disabled — 25% WR negative edge). Displacement detection loosened: full = 1.2x ATR + 50% body (was 1.5x + 60%), near-displacement = 1.0-1.2x ATR + 55% body → +12 confidence, lookback = 15 candles (was 10). Confluence dùng additive point adjustments thay vì multipliers (xem doc 027).
+
 ### 3. SMC Score (-100..+100)
 
 | Thành phần | Weight |

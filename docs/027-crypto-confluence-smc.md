@@ -22,11 +22,13 @@ Data layer: `get_derivatives_signal`, `get_cvd_signal(use_futures=True)`, `get_2
 
 | Funding (8h) | LONG | SHORT |
 |--------------|------|-------|
-| > 0.10% (extreme) | 0.6× | 1.3× |
-| > 0.05% (elevated) | 0.85× | 1.15× |
-| -0.03% ~ +0.03% (neutral) | 1.0× | 1.0× |
-| < -0.03% (elevated) | 1.15× | 0.85× |
-| < -0.07% (extreme) | 1.3× | 0.6× |
+| > 0.10% (extreme) | -12 pts | +10 pts |
+| > 0.05% (elevated) | -5 pts | +5 pts |
+| -0.03% ~ +0.03% (neutral) | 0 pts | 0 pts |
+| < -0.03% (elevated) | +5 pts | -5 pts |
+| < -0.07% (extreme) | +10 pts | -12 pts |
+
+> **Phase 1 update:** Funding giờ trả point adjustment thay vì multiplier. Points được cộng vào confidence (không nhân).
 
 ---
 
@@ -41,10 +43,12 @@ Data layer: `get_derivatives_signal`, `get_cvd_signal(use_futures=True)`, `get_2
 | Giảm | Tăng | Short squeeze / unwind |
 | Giảm | Giảm | Long liquidation / unwind |
 
-- OI tăng + price cùng chiều → xác nhận SMC direction → 1.2×
-- OI tăng + price ngược chiều → SMC ngược trend → 0.85×
-- OI giảm + price tăng → short squeeze → LONG 1.15×, SHORT 0.7×
-- OI giảm + price giảm → long liq → SHORT 1.15×, LONG 0.7×
+- OI tăng + price cùng chiều → xác nhận SMC direction → +8 pts
+- OI tăng + price ngược chiều → SMC ngược trend → -5 pts
+- OI giảm + price tăng → short squeeze → LONG +5 pts, SHORT -10 pts
+- OI giảm + price giảm → long liq → SHORT +5 pts, LONG -10 pts
+
+> **Phase 1 update:** OI giờ trả point adjustment thay vì multiplier.
 
 ---
 
@@ -55,19 +59,21 @@ Data layer: `get_derivatives_signal`, `get_cvd_signal(use_futures=True)`, `get_2
 - `cvd_ratio` > 0.58 = buy pressure dominant
 - `cvd_trend` = "accelerating_buy" | "accelerating_sell" | "neutral"
 
-| Setup | Zone | CVD | Multiplier |
+| Setup | Zone | CVD | Adjustment |
 |-------|------|-----|------------|
-| LONG | In OB/FVG | ratio > 0.58 hoặc accelerating_buy | 1.25× |
-| LONG | In OB/FVG | ratio < 0.42 hoặc accelerating_sell | 0.65× |
-| SHORT | In OB/FVG | ratio < 0.42 hoặc accelerating_sell | 1.25× |
-| SHORT | In OB/FVG | ratio > 0.58 hoặc accelerating_buy | 0.65× |
-| Ngoài zone | — | accelerating theo direction | 1.1× |
+| LONG | In OB/FVG | ratio > 0.58 hoặc accelerating_buy | +8 pts |
+| LONG | In OB/FVG | ratio < 0.42 hoặc accelerating_sell | -12 pts |
+| SHORT | In OB/FVG | ratio < 0.42 hoặc accelerating_sell | +8 pts |
+| SHORT | In OB/FVG | ratio > 0.58 hoặc accelerating_buy | -12 pts |
+| Ngoài zone | — | accelerating theo direction | +3 pts |
+
+> **Phase 1 update:** CVD giờ trả point adjustment thay vì multiplier.
 
 ---
 
 ## Tích hợp vào SMCAgent
 
-**Quan trọng:** Confidence adjustment dùng **weighted average**, không nhân liên tiếp (cascade). Tránh trường hợp 3 multiplier thấp nhân nhau gây collapse confidence quá mức.
+**Quan trọng (Phase 1 update):** Confidence adjustment dùng **weighted average of point adjustments**, không dùng multiplier nữa. Mỗi lớp trả point adjustment (range -12 to +10). Weighted average được **cộng** vào base confidence, cap tại ±15 pts. Tránh trường hợp multiplier cascade collapse confidence quá mức (base 80 × 0.6 × 0.7 × 0.65 = 22 — quá khắc nghiệt).
 
 Weights: Funding = 0.4, OI = 0.3, CVD = 0.3.
 
@@ -75,14 +81,16 @@ Weights: Funding = 0.4, OI = 0.3, CVD = 0.3.
 scan_pair(symbol)
   ├── asyncio.gather: setup, deriv, cvd, stats_24h, fear_greed
   ├── Nếu setup None/invalid → return None
-  ├── Lớp 1: interpret_funding(deriv.funding_rate, direction) → mults.append(mult), weights.append(0.4)
-  ├── Lớp 2: interpret_oi(deriv.oi_change_pct, stats.price_change_pct, direction) → mults.append(mult), weights.append(0.3)
-  ├── Lớp 3: interpret_cvd(cvd_data, direction, price_in_ob, price_in_fvg) → mults.append(mult), weights.append(0.3)
-  ├── combined_mult = weighted_average(mults, weights)
-  ├── confidence = int(base_confidence * combined_mult), clamp(0, 100)
+  ├── Lớp 1: interpret_funding(deriv.funding_rate, direction) → adjs.append(pts), weights.append(0.4)
+  ├── Lớp 2: interpret_oi(deriv.oi_change_pct, stats.price_change_pct, direction) → adjs.append(pts), weights.append(0.3)
+  ├── Lớp 3: interpret_cvd(cvd_data, direction, price_in_ob, price_in_fvg) → adjs.append(pts), weights.append(0.3)
+  ├── combined_adj = weighted_average(adjs, weights), capped to [-15, +15]
+  ├── confidence = clamp(base_confidence + combined_adj, 0, 100)
   ├── Nếu confidence < min_confidence → reject, log
   └── setup.confidence = confidence; setup.reasoning += confluence notes
 ```
+
+**Impact:** Base 80 + worst case (-15) = 65. So với trước: base 80 × worst multiplier = ~52. Hệ thống ổn định hơn, ít false reject.
 
 ---
 
@@ -90,7 +98,7 @@ scan_pair(symbol)
 
 | File | Thay đổi |
 |------|----------|
-| `utils/crypto_confluence.py` | **Mới** — `interpret_funding`, `interpret_oi`, `interpret_cvd` |
+| `utils/crypto_confluence.py` | **Mới** — `interpret_funding`, `interpret_oi`, `interpret_cvd` (trả point adjustments thay vì multipliers từ Phase 1) |
 | `agents/smc_agent.py` | Gọi 3 fetcher song song, áp dụng confluence, reject nếu confidence < min |
 
 ---

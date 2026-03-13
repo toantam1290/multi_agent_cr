@@ -31,7 +31,7 @@ async def main():
     parser.add_argument("--no-chop", action="store_true", help="SMC standalone: tắt Chop filter (chop>61.8 skip)")
     parser.add_argument("--no-funding", action="store_true", help="SMC standalone: tắt Funding alignment filter")
     parser.add_argument("--ob-only", action="store_true", help="SMC standalone: chỉ trade ob_entry, bỏ ce/sweep/bpr")
-    parser.add_argument("--no-ce", action="store_true", help="SMC standalone: bỏ ce_entry (WR thấp ~23%)")
+    parser.add_argument("--no-ce", action="store_true", help="SMC standalone: no-op, ce_entry đã bị disable mặc định trong smc_strategy.py")
     parser.add_argument("--adx", action="store_true", help="SMC standalone: chỉ trade khi ADX > 20 (trending)")
     parser.add_argument("--breakeven", type=int, default=0, metavar="N", help="Sau N candles move SL lên entry (0=off)")
     parser.add_argument("--strict", action="store_true", help="Chọn lọc cao: ob-only + chop 55 + min_conf 60")

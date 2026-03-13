@@ -103,7 +103,7 @@ class BacktestConfig:
     smc_min_confidence: int = 55     # Min confidence — tăng filter (was 50)
     smc_sl_buffer_pct: float = 0.003  # SL buffer 0.3% — tránh wick hit (was 0.2%)
     smc_ob_entry_only: bool = False   # Chỉ trade ob_entry, bỏ ce/sweep/bpr
-    smc_disable_ce_entry: bool = False  # Bỏ ce_entry (WR thấp ~23%)
+    smc_disable_ce_entry: bool = False  # No-op: ce_entry đã bị disable trong smc_strategy.py, giữ lại cho backward compat
     smc_min_grade: str = ""           # Chỉ grade A+ hoặc A: "A" | "" = không filter
     smc_displacement_only: bool = False  # Chỉ ltf_trigger=displacement, bỏ sweep/choch
     smc_chop_threshold: float = 61.8   # Chop > threshold = skip (strict: 50)

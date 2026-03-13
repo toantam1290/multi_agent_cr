@@ -84,6 +84,7 @@ class DisplacementCandle:
     direction: str      # "bullish" | "bearish"
     range_atr_ratio: float   # range / ATR — càng cao càng mạnh
     created_fvg: bool
+    is_near_displacement: bool = False
 
 
 @dataclass
@@ -121,6 +122,7 @@ class SMCSignal:
     last_structure_event: str = "none"
     structure_strength_pct: float = 0.0
     has_displacement: bool = False     # MSS có displacement candle = đáng tin hơn
+    has_near_displacement: bool = False  # Near-displacement (1.0-1.2x ATR, body>55%)
 
     # Order Blocks
     nearest_bullish_ob: Optional[OrderBlock] = None
@@ -239,7 +241,10 @@ class SMCAnalyzer:
 
         # Displacement — xác nhận MSS có tổ chức vào không
         displacements = self._detect_displacement(df_structure, atr)
-        has_displacement = len(displacements) > 0 and displacements[-1].candle_index >= len(df_structure) - 10
+        recent_full = [d for d in displacements if not d.is_near_displacement and d.candle_index >= len(df_structure) - 15]
+        recent_near = [d for d in displacements if d.is_near_displacement and d.candle_index >= len(df_structure) - 15]
+        has_displacement = len(recent_full) > 0
+        has_near_displacement = (not has_displacement) and len(recent_near) > 0
 
         # OB với mitigation check
         bull_obs, bear_obs, bull_breakers, bear_breakers = self._detect_order_blocks(
@@ -325,6 +330,7 @@ class SMCAnalyzer:
             price_in_ob, ob_dir, price_in_fvg, fvg_dir,
             price_at_ce, has_bpr, sweep_dir,
             pd_zone, price_near_pdh, price_near_pdl,
+            has_near_displacement=has_near_displacement,
         )
         smc_valid = abs(smc_score) >= 30
 
@@ -341,6 +347,7 @@ class SMCAnalyzer:
             smc_score, current_price, price_in_ob, ob_dir,
             pd_zone, in_ote=in_ote,
             institutional=institutional,
+            has_near_displacement=has_near_displacement,
         )
 
         return SMCSignal(
@@ -348,6 +355,7 @@ class SMCAnalyzer:
             last_structure_event=last_event,
             structure_strength_pct=struct_strength,
             has_displacement=has_displacement,
+            has_near_displacement=has_near_displacement,
             atr=atr,
             nearest_bullish_ob=nearest_bull_ob,
             nearest_bearish_ob=nearest_bear_ob,
@@ -460,7 +468,10 @@ class SMCAnalyzer:
         self, df: pd.DataFrame, atr: float
     ) -> list[DisplacementCandle]:
         """
-        Displacement candle: range > 1.5x ATR + body > 60% range + tạo FVG.
+        Displacement candle detection with two tiers:
+          Full displacement: range >= 1.2x ATR AND body >= 50% range
+          Near-displacement: range >= 1.0x ATR AND body > 55% range
+          Below 1.0x ATR: skip
         Chỉ xét 30 nến gần nhất.
         """
         result = []
@@ -471,10 +482,14 @@ class SMCAnalyzer:
             o = float(df["open"].iloc[i])
             c = float(df["close"].iloc[i])
             candle_range = h - l
-            if atr <= 0 or candle_range < 1.5 * atr:
+            if atr <= 0 or candle_range < 1.0 * atr:
                 continue
             body = abs(c - o)
-            if body < 0.6 * candle_range:
+
+            # Determine tier
+            is_full = candle_range >= 1.2 * atr and body >= 0.5 * candle_range
+            is_near = (not is_full) and candle_range >= 1.0 * atr and body > 0.55 * candle_range
+            if not is_full and not is_near:
                 continue
 
             direction = "bullish" if c > o else "bearish"
@@ -494,6 +509,7 @@ class SMCAnalyzer:
                 direction=direction,
                 range_atr_ratio=round(candle_range / atr, 2),
                 created_fvg=created_fvg,
+                is_near_displacement=is_near,
             ))
         return result
 
@@ -853,6 +869,7 @@ class SMCAnalyzer:
         pd_zone: Optional[PremiumDiscount],
         price_near_pdh: bool,
         price_near_pdl: bool,
+        has_near_displacement: bool = False,
     ) -> int:
         """
         SMC Score -100..+100
@@ -891,6 +908,14 @@ class SMCAnalyzer:
                 score += 10
             elif bias == "BEARISH":
                 score -= 10
+            # FVG bonus: displacement that also created FVG
+            if price_in_fvg:
+                score += 5 if bias == "BULLISH" else -5
+        elif has_near_displacement:
+            if bias == "BULLISH":
+                score += 5
+            elif bias == "BEARISH":
+                score -= 5
 
         if price_in_ob:
             score += 20 if ob_dir == "bullish" else -20
@@ -945,11 +970,14 @@ class SMCAnalyzer:
         pd_zone: Optional[PremiumDiscount],
         in_ote: bool,
         institutional: Optional[InstitutionalLevels],
+        has_near_displacement: bool = False,
     ) -> str:
         parts = [f"SMC bias={bias} ({last_event}, strength={struct_strength:.2f}%)"]
 
         if has_displacement:
             parts.append("DISPLACEMENT confirmed")
+        elif has_near_displacement:
+            parts.append("NEAR-DISPLACEMENT detected")
 
         if pd_zone:
             ote_str = " [IN OTE]" if in_ote else ""

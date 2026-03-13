@@ -58,7 +58,7 @@ class ExecutorAgent:
 
         return trade
 
-    async def _paper_execute(self, signal: TradingSignal) -> Trade:
+    async def _paper_execute(self, signal: TradingSignal) -> Optional[Trade]:
         """
         Paper trading - dùng signal.entry_price (pullback level) để maintain R:R.
         Scalp: entry = pullback level → fill tại đó (simulate limit order).
@@ -77,19 +77,45 @@ class ExecutorAgent:
         FEE_PCT = 0.001  # 0.1% mỗi chiều → 0.2% round trip
 
         # Scalp pullback entry: fill tại signal.entry_price (limit order simulated)
-        # Nếu giá đã vượt entry > 0.2% → limit không fill → simulate no fill (return None)
+        # OB-zone-aware: nếu có ob_zone thì dùng zone boundary thay vì 0.2% threshold
         if cfg.scan.trading_style == "scalp":
-            if signal.direction == Direction.LONG and current_price > signal.entry_price * 1.002:
-                logger.warning(f"[PAPER] Scalp LONG: price ${current_price:,.2f} > entry*1.002 — no fill (limit missed)")
-                return None
-            if signal.direction == Direction.SHORT and current_price < signal.entry_price * 0.998:
-                logger.warning(f"[PAPER] Scalp SHORT: price ${current_price:,.2f} < entry*0.998 — no fill (limit missed)")
-                return None
-            if signal.direction == Direction.LONG:
-                filled_price = signal.entry_price * (1 + LIMIT_SLIPPAGE_PCT)
+            smc = getattr(signal, 'smc', None) or {}
+            ob_zone_low = smc.get('ob_zone_low') if isinstance(smc, dict) else None
+            ob_zone_high = smc.get('ob_zone_high') if isinstance(smc, dict) else None
+
+            if ob_zone_low is not None and ob_zone_high is not None:
+                # OB entry: accept fill if price is within OB zone (with 0.1% tolerance)
+                if signal.direction == Direction.LONG and current_price > ob_zone_high * 1.001:
+                    logger.warning(
+                        f"[PAPER] Scalp LONG: price ${current_price:,.2f} > OB zone high "
+                        f"${ob_zone_high:,.2f}*1.001 — no fill (above OB zone)"
+                    )
+                    return None
+                if signal.direction == Direction.SHORT and current_price < ob_zone_low * 0.999:
+                    logger.warning(
+                        f"[PAPER] Scalp SHORT: price ${current_price:,.2f} < OB zone low "
+                        f"${ob_zone_low:,.2f}*0.999 — no fill (below OB zone)"
+                    )
+                    return None
+                # Fill price = better of entry vs current
+                if signal.direction == Direction.LONG:
+                    filled_price = min(signal.entry_price, current_price) * (1 + LIMIT_SLIPPAGE_PCT)
+                else:
+                    filled_price = max(signal.entry_price, current_price) * (1 - LIMIT_SLIPPAGE_PCT)
+                fill_type = "limit (OB zone)"
             else:
-                filled_price = signal.entry_price * (1 - LIMIT_SLIPPAGE_PCT)
-            fill_type = "limit (pullback)"
+                # Non-OB entries: keep existing 0.2% logic
+                if signal.direction == Direction.LONG and current_price > signal.entry_price * 1.002:
+                    logger.warning(f"[PAPER] Scalp LONG: price ${current_price:,.2f} > entry*1.002 — no fill (limit missed)")
+                    return None
+                if signal.direction == Direction.SHORT and current_price < signal.entry_price * 0.998:
+                    logger.warning(f"[PAPER] Scalp SHORT: price ${current_price:,.2f} < entry*0.998 — no fill (limit missed)")
+                    return None
+                if signal.direction == Direction.LONG:
+                    filled_price = signal.entry_price * (1 + LIMIT_SLIPPAGE_PCT)
+                else:
+                    filled_price = signal.entry_price * (1 - LIMIT_SLIPPAGE_PCT)
+                fill_type = "limit (pullback)"
         else:
             if signal.direction == Direction.LONG:
                 filled_price = current_price * (1 + SLIPPAGE_PCT)

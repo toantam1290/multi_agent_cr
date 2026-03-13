@@ -28,7 +28,7 @@ Nâng cấp SMC từ mức cơ bản lên mức hiện đại (ICT 2024-2025, pr
 | Thuật toán | Mô tả |
 |------------|-------|
 | OB Mitigation + Breaker Block | OB bị break → mark mitigated, flip thành Breaker Block ngược chiều |
-| Displacement candle | range > 1.5× ATR, body > 60% range, tạo FVG — xác nhận MSS thật |
+| Displacement candle | Full: range > 1.2× ATR, body > 50% range. Near: 1.0-1.2× ATR + 55% body → +12 confidence. Lookback 15 candles. FVG bonus +5. (Phase 1 update — was 1.5× + 60%) |
 | Premium/Discount + OTE | Fib 50% = equilibrium, 62-79% = OTE entry zone |
 | PDH/PDL/PWH/PWL | Institutional reference levels |
 | FVG: CE + BPR + Inversion | CE = 50% FVG, BPR = 2 FVG overlap, Inversion = FVG filled + flip |
@@ -54,7 +54,7 @@ Top-down multi-TF analysis:
 class SMCSetup:
     symbol: str
     direction: str           # LONG | SHORT
-    entry_model: str         # ob_entry | ce_entry | bpr_entry | sweep_reversal
+    entry_model: str         # ob_entry | bpr_entry | sweep_reversal  (ce_entry disabled — Phase 1)
     entry_model_quality: str # A+ | A | B | C
     htf_bias: str
     mtf_bias: str

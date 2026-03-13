@@ -85,7 +85,7 @@ Controlled by `TRADING_STYLE` env var (auto-detected from `SCAN_MODE`):
 - `utils/market_data.py`: `BinanceDataFetcher` (OHLCV, derivatives, CVD, 24h stats), `WhaleDataFetcher`, `FearGreedFetcher`, `get_opportunity_pairs()`, `classify_regime()`, `calc_entry_sl_tp()`.
 - `utils/smc.py`: `SMCAnalyzer` — order blocks, FVGs, BOS/CHoCH, liquidity sweeps.
 - `utils/smc_strategy.py`: `SMCStrategy` — top-down HTF→MTF→LTF analysis producing `SMCSetup`.
-- `utils/crypto_confluence.py`: `interpret_funding()`, `interpret_oi()`, `interpret_cvd()` — confidence multipliers for SMC signals.
+- `utils/crypto_confluence.py`: `interpret_funding()`, `interpret_oi()`, `interpret_cvd()` — point adjustments (-12 to +10) added to SMC signal confidence.
 - `telegram_bot.py`: `TelegramNotifier` — signal alerts, /approve, /skip, daily reports, heartbeat.
 - `optimization/`: Walk-forward optimizer, metrics calculator, improvement engine, change registry.
 
@@ -105,6 +105,8 @@ Controlled by `TRADING_STYLE` env var (auto-detected from `SCAN_MODE`):
 - The project uses Vietnamese comments throughout. Config validation errors and log messages are in Vietnamese.
 - DB path is absolute (`Path(__file__).resolve().parent / "data" / "trading.db"`) so web UI and scripts share the same DB.
 - Scan modes: `fixed` (uses `ALLOWED_PAIRS`) vs `opportunity` (dynamic screening by volatility/volume from Binance tickers).
-- **SMC entry**: OB entry uses OB midpoint (not edge), SL uses ATR-based buffer (`0.5 × ATR`, floor 0.2% of price) instead of fixed percentage.
-- **Confluence adjustment**: Weighted average of multipliers (funding 0.4, OI 0.3, CVD 0.3), not multiplicative cascade — prevents triple-penalty collapse.
+- **SMC entry**: OB entry uses OB zone fill (low→high range, not exact midpoint). Entry = better of (midpoint, current_price). SL uses ATR-based buffer (`0.5 × ATR`, floor 0.2% of price) instead of fixed percentage. `SMCSetup` has `ob_zone_low/ob_zone_high` fields.
+- **SMC entry cascade**: `ob_entry → sweep_reversal → bpr_entry`. `ce_entry` is disabled (25% WR on 67 backtest trades was clear negative edge).
+- **Confluence adjustment**: Weighted average of point adjustments (-12 to +10, weights: funding 0.4, OI 0.3, CVD 0.3), capped ±15, added to confidence (not multiplied). Example: base 80 + worst case adjustment = ~70 (vs old multiplicative approach that could collapse to 52).
+- **Displacement detection**: Full displacement = 1.2x ATR + 50% body ratio. Near-displacement (1.0-1.2x ATR + 55% body) grants +12 confidence. Lookback = 15 candles. FVG bonus +5 for full displacement with FVG.
 - **Funding filter**: Symmetric ±0.03% — blocks LONG when funding > +0.03% and SHORT when funding < -0.03%.
