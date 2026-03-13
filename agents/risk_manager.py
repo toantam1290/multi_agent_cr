@@ -159,10 +159,11 @@ class RiskManagerAgent:
         stats = self.db.get_stats()
         daily_pnl = self.db.get_daily_pnl()
 
+        cumulative_pnl = self.db.get_cumulative_pnl()
         if cfg.trading.paper_trading:
-            total = cfg.trading.paper_balance_usdt
+            total = cfg.trading.paper_balance_usdt + cumulative_pnl
         else:
-            total = 10000.0  # TODO: fetch from Binance
+            total = 10000.0 + cumulative_pnl  # TODO: fetch base from Binance
 
         return PortfolioState(
             total_usdt=total,

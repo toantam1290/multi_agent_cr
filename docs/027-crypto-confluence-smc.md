@@ -18,11 +18,13 @@ Data layer: `get_derivatives_signal`, `get_cvd_signal(use_futures=True)`, `get_2
 
 **Logic:** Funding cao dương = thị trường overleveraged long → SHORT setup được boost, LONG bị penalize. Ngược lại với funding âm.
 
+**Funding filter (symmetric ±0.03%):** Config `FUNDING_LONG_MAX_PCT=0.03`, `FUNDING_SHORT_MIN_PCT=-0.03`. Block LONG khi funding > +0.03%, block SHORT khi funding < -0.03%. Đảm bảo filter symmetric — trước đây chỉ filter 1 chiều.
+
 | Funding (8h) | LONG | SHORT |
 |--------------|------|-------|
 | > 0.10% (extreme) | 0.6× | 1.3× |
 | > 0.05% (elevated) | 0.85× | 1.15× |
-| -0.07% ~ +0.05% (neutral) | 1.0× | 1.0× |
+| -0.03% ~ +0.03% (neutral) | 1.0× | 1.0× |
 | < -0.03% (elevated) | 1.15× | 0.85× |
 | < -0.07% (extreme) | 1.3× | 0.6× |
 
@@ -65,14 +67,19 @@ Data layer: `get_derivatives_signal`, `get_cvd_signal(use_futures=True)`, `get_2
 
 ## Tích hợp vào SMCAgent
 
+**Quan trọng:** Confidence adjustment dùng **weighted average**, không nhân liên tiếp (cascade). Tránh trường hợp 3 multiplier thấp nhân nhau gây collapse confidence quá mức.
+
+Weights: Funding = 0.4, OI = 0.3, CVD = 0.3.
+
 ```
 scan_pair(symbol)
-  ├── asyncio.gather: setup, deriv, cvd, stats_24h
+  ├── asyncio.gather: setup, deriv, cvd, stats_24h, fear_greed
   ├── Nếu setup None/invalid → return None
-  ├── Lớp 1: interpret_funding(deriv.funding_rate, direction) → confidence *= mult
-  ├── Lớp 2: interpret_oi(deriv.oi_change_pct, stats.price_change_pct, direction) → confidence *= mult
-  ├── Lớp 3: interpret_cvd(cvd_data, direction, price_in_ob, price_in_fvg) → confidence *= mult
-  ├── confidence = clamp(0, 100)
+  ├── Lớp 1: interpret_funding(deriv.funding_rate, direction) → mults.append(mult), weights.append(0.4)
+  ├── Lớp 2: interpret_oi(deriv.oi_change_pct, stats.price_change_pct, direction) → mults.append(mult), weights.append(0.3)
+  ├── Lớp 3: interpret_cvd(cvd_data, direction, price_in_ob, price_in_fvg) → mults.append(mult), weights.append(0.3)
+  ├── combined_mult = weighted_average(mults, weights)
+  ├── confidence = int(base_confidence * combined_mult), clamp(0, 100)
   ├── Nếu confidence < min_confidence → reject, log
   └── setup.confidence = confidence; setup.reasoning += confluence notes
 ```

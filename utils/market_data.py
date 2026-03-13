@@ -382,7 +382,7 @@ class BinanceDataFetcher:
             )
             df_fast = df_15m  # direction + setup: RSI, EMA, MACD, volume, BB
             df_atr = df_5m    # ATR SL/TP + RSI 5m pullback timing
-            df_slow = df_5m   # rsi_4h = RSI 5m (pullback)
+            df_slow = df_4h   # rsi_4h = RSI-14 trên 4h thực tế
             df_trend = df_4h
             df_adx = df_1h
             min_rows = 50

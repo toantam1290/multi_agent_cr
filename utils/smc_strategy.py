@@ -204,10 +204,18 @@ class SMCStrategy:
         """
         htf_bias = htf.bias
         ltf_bias = ltf.bias
-        if htf_bias == "NEUTRAL" or ltf_bias == "NEUTRAL":
+        # LTF NEUTRAL = không có entry trigger → reject
+        if ltf_bias == "NEUTRAL":
             return None
-        if htf_bias != ltf_bias:
-            return None
+
+        # HTF NEUTRAL = dùng LTF bias với penalty
+        bias_penalty = 1.0
+        if htf_bias == "NEUTRAL":
+            htf_bias = ltf_bias
+            bias_penalty = 0.8
+        elif htf_bias != ltf_bias:
+            # HTF và LTF disagree — cho phép nhưng penalty, HTF dominates direction
+            bias_penalty = 0.7
 
         direction = "LONG" if htf_bias == "BULLISH" else "SHORT"
 
@@ -237,6 +245,9 @@ class SMCStrategy:
         confidence, reasoning = self._score_setup(
             direction, htf, ltf, ltf_trigger, entry_model, rr_tp1
         )
+        confidence = int(confidence * bias_penalty)
+        if bias_penalty < 1.0:
+            reasoning += f" | TF alignment penalty ×{bias_penalty}"
         if confidence < self.min_confidence:
             return None
 
@@ -284,22 +295,24 @@ class SMCStrategy:
         htf: SMCSignal,
     ) -> tuple[Optional[str], Optional[float], Optional[float]]:
         """
-        Ưu tiên entry model theo WR backtest: OB (58%) > sweep > CE > BPR.
-        sl_buffer_pct: buffer dưới/trên zone để tránh SL hit bởi wick (default 0.5%).
+        Ưu tiên entry model theo WR backtest: OB > sweep > CE > BPR.
+        SL buffer dùng ATR thay vì % price — scale với volatility thực tế.
         """
-        buf = self.sl_buffer_pct
+        # ATR-based buffer: 0.5 × ATR, floor = 0.2% price
+        atr_buf = ltf.atr * 0.5 if ltf.atr > 0 else current_price * self.sl_buffer_pct
+        atr_buf = max(atr_buf, current_price * 0.002)
 
-        # Model 1: OB entry — WR 58%, ưu tiên cao nhất
+        # Model 1: OB entry — WR cao nhất, entry tại OB midpoint
         if ltf.price_in_ob:
             if direction == "LONG" and ltf.nearest_bullish_ob:
                 ob = ltf.nearest_bullish_ob
-                entry = current_price
-                sl = ob.price_low - current_price * buf
+                entry = ob.mid
+                sl = ob.price_low - atr_buf
                 return "ob_entry", entry, sl
             if direction == "SHORT" and ltf.nearest_bearish_ob:
                 ob = ltf.nearest_bearish_ob
-                entry = current_price
-                sl = ob.price_high + current_price * buf
+                entry = ob.mid
+                sl = ob.price_high + atr_buf
                 return "ob_entry", entry, sl
 
         # Model 2: Sweep reversal
@@ -307,13 +320,13 @@ class SMCStrategy:
             if ltf.sell_side_liquidity:
                 sweep_price = ltf.sell_side_liquidity.price
                 entry = current_price
-                sl = sweep_price - current_price * max(0.003, buf)
+                sl = sweep_price - max(atr_buf, current_price * 0.003)
                 return "sweep_reversal", entry, sl
         if ltf.sweep_direction == "buy_side_swept" and direction == "SHORT":
             if ltf.buy_side_liquidity:
                 sweep_price = ltf.buy_side_liquidity.price
                 entry = current_price
-                sl = sweep_price + current_price * max(0.003, buf)
+                sl = sweep_price + max(atr_buf, current_price * 0.003)
                 return "sweep_reversal", entry, sl
 
         # Model 3: CE entry (FVG 50%)
@@ -321,33 +334,33 @@ class SMCStrategy:
             if direction == "LONG" and ltf.nearest_bullish_fvg and not ltf.nearest_bullish_fvg.filled:
                 fvg = ltf.nearest_bullish_fvg
                 entry = fvg.ce if ltf.price_at_ce else current_price
-                sl = fvg.bottom - current_price * buf
+                sl = fvg.bottom - atr_buf
                 return "ce_entry", entry, sl
             if direction == "SHORT" and ltf.nearest_bearish_fvg and not ltf.nearest_bearish_fvg.filled:
                 fvg = ltf.nearest_bearish_fvg
                 entry = fvg.ce if ltf.price_at_ce else current_price
-                sl = fvg.top + current_price * buf
+                sl = fvg.top + atr_buf
                 return "ce_entry", entry, sl
 
         # Model 4: BPR entry
         if ltf.has_bpr:
             if direction == "LONG" and (ltf.bpr_overlap_bottom is not None and ltf.bpr_overlap_top is not None):
                 entry = (ltf.bpr_overlap_top + ltf.bpr_overlap_bottom) / 2
-                sl = ltf.bpr_overlap_bottom - current_price * buf
+                sl = ltf.bpr_overlap_bottom - atr_buf
                 return "bpr_entry", entry, sl
             if direction == "LONG" and ltf.nearest_bullish_fvg:
                 fvg = ltf.nearest_bullish_fvg
                 entry = fvg.ce
-                sl = fvg.bottom - current_price * buf
+                sl = fvg.bottom - atr_buf
                 return "bpr_entry", entry, sl
             if direction == "SHORT" and (ltf.bpr_overlap_bottom is not None and ltf.bpr_overlap_top is not None):
                 entry = (ltf.bpr_overlap_top + ltf.bpr_overlap_bottom) / 2
-                sl = ltf.bpr_overlap_top + current_price * buf
+                sl = ltf.bpr_overlap_top + atr_buf
                 return "bpr_entry", entry, sl
             if direction == "SHORT" and ltf.nearest_bearish_fvg:
                 fvg = ltf.nearest_bearish_fvg
                 entry = fvg.ce
-                sl = fvg.top + current_price * buf
+                sl = fvg.top + atr_buf
                 return "bpr_entry", entry, sl
 
         return None, None, None
@@ -470,7 +483,7 @@ class SMCStrategy:
         if (
             confidence >= 80
             and ltf_trigger in ("displacement", "sweep")
-            and entry_model in ("sweep_reversal", "bpr_entry", "ce_entry")
+            and entry_model in ("ob_entry", "sweep_reversal", "bpr_entry", "ce_entry")
             and ltf.in_ote
         ):
             return "A+"

@@ -83,11 +83,14 @@ class SMCAgent:
                 base_confidence = setup.confidence
                 confidence = base_confidence
                 confluence_notes = []
+                mults = []
+                weights = []
 
                 # Lớp 1: Funding Rate (chỉ khi fetch OK — tránh magic number)
                 if deriv and deriv.fetch_ok:
                     fr_mult, fr_note = interpret_funding(deriv.funding_rate, setup.direction)
-                    confidence = int(confidence * fr_mult)
+                    mults.append(fr_mult)
+                    weights.append(0.4)
                     confluence_notes.append(fr_note)
 
                 # Lớp 2: Open Interest (cần deriv.fetch_ok — OI từ cùng API)
@@ -97,7 +100,8 @@ class SMCAgent:
                         stats_24h.get("price_change_pct", 0),
                         setup.direction,
                     )
-                    confidence = int(confidence * oi_mult)
+                    mults.append(oi_mult)
+                    weights.append(0.3)
                     confluence_notes.append(oi_note)
 
                 # Lớp 3: CVD
@@ -106,8 +110,15 @@ class SMCAgent:
                     in_ob = ltf.price_in_ob if ltf else False
                     in_fvg = ltf.price_in_fvg if ltf else False
                     cvd_mult, cvd_note = interpret_cvd(cvd_data, setup.direction, in_ob, in_fvg)
-                    confidence = int(confidence * cvd_mult)
+                    mults.append(cvd_mult)
+                    weights.append(0.3)
                     confluence_notes.append(cvd_note)
+
+                # Weighted average thay vì nhân liên tiếp — tránh cascade collapse
+                if mults:
+                    total_w = sum(weights)
+                    combined_mult = sum(m * w for m, w in zip(mults, weights)) / total_w
+                    confidence = int(confidence * combined_mult)
 
                 confidence = max(0, min(100, confidence))
                 min_conf = get_effective_min_confidence()
@@ -122,13 +133,13 @@ class SMCAgent:
                 if confluence_notes:
                     setup.reasoning += " | Confluence: " + " | ".join(confluence_notes)
 
-                # F&G extreme — block LONG khi Extreme Fear, block SHORT khi Extreme Greed
+                # F&G extreme — block LONG khi Greed (overbought), block SHORT khi Fear (oversold)
                 if style == "scalp":
-                    if setup.direction == "LONG" and fg < 25:
-                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Fear) → skip LONG scalp")
+                    if setup.direction == "LONG" and fg > 75:
+                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Greed) → skip LONG scalp")
                         return None
-                    if setup.direction == "SHORT" and fg > 75:
-                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Greed) → skip SHORT scalp")
+                    if setup.direction == "SHORT" and fg < 25:
+                        logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Fear) → skip SHORT scalp")
                         return None
 
                 available = await self._get_available_balance()
@@ -253,11 +264,12 @@ class SMCAgent:
             return None
 
     async def _get_available_balance(self) -> float:
-        """Lấy available balance (trừ locked capital trong open positions). Giống ResearchAgent."""
+        """Lấy available balance (trừ locked capital + cumulative losses)."""
+        cumulative_pnl = self.db.get_cumulative_pnl()
         if cfg.trading.paper_trading:
-            total = cfg.trading.paper_balance_usdt
+            total = cfg.trading.paper_balance_usdt + cumulative_pnl
         else:
-            total = 10000.0  # TODO: Fetch from Binance
+            total = 10000.0 + cumulative_pnl  # TODO: Fetch base from Binance
         open_trades = self.db.get_open_trades()
         locked = sum(t["position_size_usdt"] for t in open_trades)
         return max(0.0, total - locked)

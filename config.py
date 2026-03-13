@@ -77,8 +77,8 @@ class ScanConfig:
     scalp_rsi_long_max: float = float(os.getenv("SCALP_RSI_LONG_MAX", "50"))
     scalp_rsi_short_min: float = float(os.getenv("SCALP_RSI_SHORT_MIN", "50"))
     # Funding: LONG cần funding < max, SHORT cần funding > min
-    funding_long_max_pct: float = float(os.getenv("FUNDING_LONG_MAX_PCT", "0.05"))
-    funding_short_min_pct: float = float(os.getenv("FUNDING_SHORT_MIN_PCT", "0.005"))  # 0.005% = neutral+ ok
+    funding_long_max_pct: float = float(os.getenv("FUNDING_LONG_MAX_PCT", "0.03"))
+    funding_short_min_pct: float = float(os.getenv("FUNDING_SHORT_MIN_PCT", "-0.03"))  # Symmetric: block SHORT chỉ khi funding cực âm
     # 1h range min (high-low)/close % — scalp cần coin đang active, không phải 24h đã move xong
     scalp_1h_range_min_pct: float = float(os.getenv("SCALP_1H_RANGE_MIN_PCT", "0.5"))
     # Scalp active hours UTC (ví dụ "8-16" = 8h-16h UTC). Để trống = 24/7

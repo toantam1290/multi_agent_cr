@@ -154,6 +154,9 @@ class SMCSignal:
     price_near_pdh: bool = False
     price_near_pdl: bool = False
 
+    # ATR (từ structure TF)
+    atr: float = 0.0
+
     # Summary
     smc_score: int = 0
     smc_valid: bool = False
@@ -345,6 +348,7 @@ class SMCAnalyzer:
             last_structure_event=last_event,
             structure_strength_pct=struct_strength,
             has_displacement=has_displacement,
+            atr=atr,
             nearest_bullish_ob=nearest_bull_ob,
             nearest_bearish_ob=nearest_bear_ob,
             price_in_ob=price_in_ob,
@@ -392,11 +396,15 @@ class SMCAnalyzer:
         return float(pd.Series(trs[-period:]).mean())
 
     def _detect_swings(self, df: pd.DataFrame, n: int = 5) -> tuple[list[int], list[int]]:
-        """Swing High/Low với window n nến mỗi bên."""
+        """Swing High/Low với window n nến mỗi bên. Mở rộng đến cuối df (right-side asymmetric)."""
         highs, lows = [], []
-        for i in range(n, len(df) - n):
-            window_h = df["high"].iloc[i - n : i + n + 1]
-            window_l = df["low"].iloc[i - n : i + n + 1]
+        for i in range(n, len(df)):
+            right_bound = min(i + n + 1, len(df))
+            # Yêu cầu ít nhất 2 nến bên phải để tránh false swing ở biên
+            if right_bound - i < 2 and i < len(df) - 1:
+                continue
+            window_h = df["high"].iloc[i - n : right_bound]
+            window_l = df["low"].iloc[i - n : right_bound]
             if float(df["high"].iloc[i]) == float(window_h.max()):
                 highs.append(i)
             if float(df["low"].iloc[i]) == float(window_l.min()):
@@ -516,7 +524,7 @@ class SMCAnalyzer:
                     next_c = float(df["close"].iloc[i + 1])
                     impulse = (next_c - c) / c * 100
                     if impulse < 0.3:
-                        break
+                        continue  # Tìm OB tiếp theo thay vì bỏ qua swing này
                     ob_high = float(df["high"].iloc[i])
                     ob_low = float(df["low"].iloc[i])
 
@@ -559,7 +567,7 @@ class SMCAnalyzer:
                     next_c = float(df["close"].iloc[i + 1])
                     impulse = (c - next_c) / c * 100
                     if impulse < 0.3:
-                        break
+                        continue  # Tìm OB tiếp theo thay vì bỏ qua swing này
                     ob_high = float(df["high"].iloc[i])
                     ob_low = float(df["low"].iloc[i])
 

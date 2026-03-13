@@ -6,7 +6,7 @@ import logging
 import signal as sys_signal
 import sys
 import threading
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
 
@@ -55,6 +55,7 @@ class TradingOrchestrator:
         self._running = False
         self._circuit_breaker_triggered = False
         self._circuit_breaker_date: date | None = None  # Ngày trigger để reset khi qua ngày mới
+        self._circuit_breaker_triggered_at: datetime | None = None
 
     async def start(self):
         """Khởi động toàn bộ hệ thống"""
@@ -351,9 +352,10 @@ class TradingOrchestrator:
                                 fee_cost = t["position_size_usdt"] * FEE_PCT * 2
                                 pnl = pnl - fee_cost
                                 pnl_pct = pnl / t["position_size_usdt"] * 100
+                                time_exit_status = TradeStatus.TOOK_PROFIT if pnl > 0 else TradeStatus.STOPPED
                                 self.db.close_trade(
                                     trade_id=t["id"],
-                                    status=TradeStatus.TOOK_PROFIT.value,
+                                    status=time_exit_status.value,
                                     closed_at=datetime.now(timezone.utc).isoformat(),
                                     exit_price=exit_price,
                                     pnl_usdt=pnl,
@@ -377,7 +379,13 @@ class TradingOrchestrator:
                              (direction == Direction.SHORT and current_price <= t["take_profit"])
 
                     if hit_sl or hit_tp:
-                        exit_price = t["stop_loss"] if hit_sl else t["take_profit"]
+                        # Slippage thực tế: SL 0.1% bất lợi, TP 0.05% bất lợi
+                        if hit_sl:
+                            sl_slip = 0.001
+                            exit_price = t["stop_loss"] * (1 - sl_slip) if direction == Direction.LONG else t["stop_loss"] * (1 + sl_slip)
+                        else:
+                            tp_slip = 0.0005
+                            exit_price = t["take_profit"] * (1 - tp_slip) if direction == Direction.LONG else t["take_profit"] * (1 + tp_slip)
                         quantity = t["quantity"]
 
                         if direction == Direction.LONG:
@@ -419,36 +427,64 @@ class TradingOrchestrator:
             await fetcher.close()
 
     async def _circuit_breaker_check(self):
-        """Dừng toàn bộ nếu loss vượt giới hạn ngày. Resume khi qua ngày mới hoặc PnL hồi phục."""
+        """Dừng toàn bộ nếu loss vượt giới hạn ngày. Resume khi qua ngày mới hoặc PnL hồi phục đủ."""
         today = datetime.now(timezone.utc).date()
         daily_pnl = self.db.get_daily_pnl()
-        portfolio_value = cfg.trading.paper_balance_usdt if cfg.trading.paper_trading else 10000.0
+
+        # Tính unrealized PnL từ open positions
+        open_trades = self.db.get_open_trades()
+        if open_trades and cfg.trading.paper_trading:
+            from utils.market_data import BinanceDataFetcher
+            fetcher = BinanceDataFetcher()
+            try:
+                for t in open_trades:
+                    try:
+                        cp = await fetcher.get_current_price(t["pair"])
+                        direction = Direction(t["direction"])
+                        if direction == Direction.LONG:
+                            unrealized = (cp - t["entry_price"]) / t["entry_price"] * t["position_size_usdt"]
+                        else:
+                            unrealized = (t["entry_price"] - cp) / t["entry_price"] * t["position_size_usdt"]
+                        daily_pnl += unrealized
+                    except Exception:
+                        pass
+            finally:
+                await fetcher.close()
+
+        cumulative_pnl = self.db.get_cumulative_pnl()
+        portfolio_value = cfg.trading.paper_balance_usdt + cumulative_pnl if cfg.trading.paper_trading else 10000.0 + cumulative_pnl
         max_loss = portfolio_value * cfg.trading.max_daily_loss_pct
 
         # Reset khi qua ngày mới (circuit breaker chỉ áp dụng trong ngày trigger)
         if self._circuit_breaker_triggered and self._circuit_breaker_date and today > self._circuit_breaker_date:
             self._circuit_breaker_triggered = False
             self._circuit_breaker_date = None
+            self._circuit_breaker_triggered_at = None
             self.scheduler.resume_job("market_scan")
             self.scheduler.resume_job("smc_scan")
             logger.info("Circuit breaker: Resumed market scan (new day)")
             await self.telegram.send_message("✅ *Circuit breaker lifted* — New day, trading resumed.")
             return
 
-        if daily_pnl >= -max_loss:
+        # Hysteresis: phải recover đến 50% max_loss VÀ chờ ít nhất 1 giờ
+        recovery_threshold = -max_loss * 0.5
+        if daily_pnl >= recovery_threshold:
             if self._circuit_breaker_triggered:
-                self._circuit_breaker_triggered = False
-                self._circuit_breaker_date = None
-                self.scheduler.resume_job("market_scan")
-                self.scheduler.resume_job("smc_scan")
-                logger.info("Circuit breaker: Resumed market scan (PnL recovered)")
-                await self.telegram.send_message("✅ *Circuit breaker lifted* — Trading resumed.")
+                elapsed = (datetime.now(timezone.utc) - self._circuit_breaker_triggered_at) if self._circuit_breaker_triggered_at else timedelta(hours=2)
+                if elapsed >= timedelta(hours=1):
+                    self._circuit_breaker_triggered = False
+                    self._circuit_breaker_date = None
+                    self.scheduler.resume_job("market_scan")
+                    self.scheduler.resume_job("smc_scan")
+                    logger.info("Circuit breaker: Resumed (PnL recovered past 50% threshold)")
+                    await self.telegram.send_message("✅ *Circuit breaker lifted* — PnL recovered sufficiently.")
             return
 
         if daily_pnl < -max_loss:
             if not self._circuit_breaker_triggered:
                 self._circuit_breaker_triggered = True
                 self._circuit_breaker_date = today
+                self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
                 self.scheduler.pause_job("market_scan")
                 self.scheduler.pause_job("smc_scan")
                 logger.warning(f"CIRCUIT BREAKER: Daily loss ${daily_pnl:.2f} exceeded limit ${-max_loss:.2f}")

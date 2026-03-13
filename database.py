@@ -357,6 +357,13 @@ class Database:
         ).fetchone()
         return row["total"] if row else 0.0
 
+    def get_cumulative_pnl(self) -> float:
+        """Tổng PnL tất cả trades đã đóng (all-time)."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(pnl_usdt), 0) as total FROM trades WHERE status != 'OPEN'"
+        ).fetchone()
+        return row["total"] if row else 0.0
+
     def get_stats(self) -> dict:
         row = self.conn.execute("""
             SELECT
