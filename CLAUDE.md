@@ -67,7 +67,7 @@ Scheduler (APScheduler)
 ### Two Independent Scanners
 
 - **ResearchAgent** (`agents/research_agent.py`): Fetches technicals (RSI, EMA, MACD, BB, VWAP, ADX), whale data, sentiment, derivatives. Calls Claude Sonnet as a pre-mortem risk assessor (not predictor). Budget-capped via `ANTHROPIC_DAILY_BUDGET_USD`.
-- **SMCAgent** (`agents/smc_agent.py`): Pure rule-based ICT/Smart Money Concepts. Uses `SMCStrategy` for top-down multi-TF analysis (Daily→4h/1h→15m/5m). Adjusts confidence via crypto confluence (funding rate, OI, CVD). No LLM calls.
+- **SMCAgent** (`agents/smc_agent.py`): Pure rule-based ICT/Smart Money Concepts. Uses `SMCStrategy` for top-down multi-TF analysis (Daily→4h/1h→15m/5m). Adjusts confidence via crypto confluence (funding rate, OI, CVD). No LLM calls. Supports both `fixed` (ALLOWED_PAIRS) and `opportunity` (dynamic screening) scan modes — same screening logic as ResearchAgent.
 
 Both scanners produce `TradingSignal` objects that flow through the same pipeline.
 

@@ -20,7 +20,7 @@ from loguru import logger
 from config import cfg, ALLOWED_PAIRS, get_effective_min_confidence
 from database import Database
 from models import TradingSignal, Direction, SignalStatus, TechnicalSignal, WhaleSignal, SentimentSignal
-from utils.market_data import BinanceDataFetcher, FearGreedFetcher
+from utils.market_data import BinanceDataFetcher, FearGreedFetcher, get_opportunity_pairs
 from utils.smc_strategy import SMCStrategy, SMCSetup
 from utils.crypto_confluence import interpret_funding, interpret_oi, interpret_cvd
 
@@ -182,15 +182,118 @@ class SMCAgent:
                 logger.warning(f"SMCAgent {symbol}: {type(e).__name__}: {e}")
                 return None
 
-    async def run_full_scan(self) -> list[TradingSignal]:
-        """Scan tất cả ALLOWED_PAIRS song song."""
-        logger.info(f"SMC scan starting — {len(ALLOWED_PAIRS)} pairs")
+    async def _get_pairs_to_scan(self) -> list[str]:
+        """Lấy danh sách pairs: fixed → ALLOWED_PAIRS, opportunity → dynamic screening."""
+        sc = cfg.scan
+        if sc.scan_mode != "opportunity":
+            return list(ALLOWED_PAIRS)
 
-        tasks = [self.scan_pair(pair) for pair in ALLOWED_PAIRS]
+        from datetime import datetime, timezone
+
+        # Scalp active hours filter
+        if sc.trading_style == "scalp" and sc.scalp_active_hours_utc:
+            parts = sc.scalp_active_hours_utc.split("-")
+            if len(parts) == 2:
+                h = datetime.now(timezone.utc).hour
+                if not (int(parts[0]) <= h < int(parts[1])):
+                    logger.info(f"SMC: outside active hours ({sc.scalp_active_hours_utc} UTC), skipping")
+                    return []
+
+        tickers, premium_data = await asyncio.gather(
+            self.binance.get_all_tickers_24hr(),
+            self.binance.get_premium_index_full(),
+        )
+        if not tickers:
+            logger.warning("SMC: tickers failed, fallback to ALLOWED_PAIRS")
+            return list(ALLOWED_PAIRS)
+
+        futures_symbols = set(p["symbol"] for p in premium_data) if premium_data else set()
+        funding_map = (
+            {p["symbol"]: float(p.get("lastFundingRate") or 0) for p in premium_data}
+            if premium_data else {}
+        )
+
+        # Confluence min từ BTC 24h
+        confluence_min = 2 if sc.market_regime == "sideways" else 1
+        if sc.market_regime_mode == "auto":
+            btc_ticker = next((t for t in tickers if t.get("symbol") == "BTCUSDT"), None)
+            if btc_ticker:
+                btc_pct = abs(float(btc_ticker.get("priceChangePercent") or 0))
+                confluence_min = 2 if btc_pct < 2.0 else 1
+
+        # Cooldown
+        scan_states = self.db.get_all_scan_states()
+        now_ts = datetime.now(timezone.utc)
+        cutoff = now_ts.timestamp() - sc.cooldown_cycles * sc.cycle_interval_sec
+
+        def _parse_ts(ts_str: str) -> float:
+            s = (ts_str or "").replace("Z", "+00:00")
+            if not s:
+                return 0.0
+            try:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                return 0.0
+
+        symbols_in_cooldown = {
+            s for s, st in scan_states.items()
+            if st.get("last_scanned_at") and _parse_ts(st["last_scanned_at"]) > cutoff
+        }
+
+        pairs = get_opportunity_pairs(
+            tickers,
+            futures_symbols=futures_symbols or None,
+            funding_map=funding_map or None,
+            min_volatility_pct=sc.opportunity_volatility_pct,
+            max_volatility_pct=sc.opportunity_volatility_max_pct,
+            min_quote_volume_usd=sc.min_quote_volume_usd,
+            max_pairs_per_scan=sc.max_pairs_per_scan,
+            core_pairs=sc.core_pairs,
+            blacklist=sc.scan_blacklist,
+            allowed_pairs=ALLOWED_PAIRS if sc.opportunity_use_whitelist else None,
+            use_whitelist=sc.opportunity_use_whitelist,
+            confluence_min_score=confluence_min,
+            funding_extreme_threshold=sc.funding_extreme_threshold,
+            symbols_in_cooldown=symbols_in_cooldown,
+            scan_states=scan_states,
+            hysteresis_entry_pct=sc.hysteresis_entry_pct,
+            hysteresis_exit_pct=sc.hysteresis_exit_pct,
+        )
+        logger.info(f"SMC opportunity scan: {len(pairs)} pairs")
+        return pairs
+
+    async def run_full_scan(self) -> list[TradingSignal]:
+        """Scan pairs — fixed: ALLOWED_PAIRS, opportunity: dynamic screening."""
+        pairs_to_scan = await self._get_pairs_to_scan()
+        if not pairs_to_scan:
+            logger.info("SMC: no pairs to scan")
+            return []
+
+        # Session filter (scalp)
+        sc = cfg.scan
+        if sc.trading_style == "scalp" and sc.scalp_session_filter:
+            from datetime import datetime, timezone
+            hour_utc = datetime.now(timezone.utc).hour
+            session = "london" if 8 <= hour_utc < 13 else ("ny_overlap" if 13 <= hour_utc < 20 else ("asia" if hour_utc < 8 else "dead_zone"))
+            if session == "dead_zone":
+                logger.info("SMC: dead_zone session, skipping scan")
+                return []
+            if session == "asia":
+                pairs_to_scan = [p for p in pairs_to_scan if p in sc.core_pairs]
+                if not pairs_to_scan:
+                    logger.info("SMC: asia session, no core pairs in list")
+                    return []
+
+        logger.info(f"SMC scan starting — {len(pairs_to_scan)} pairs ({sc.scan_mode})")
+
+        tasks = [self.scan_pair(pair) for pair in pairs_to_scan]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         signals = []
-        for pair, r in zip(ALLOWED_PAIRS, results):
+        for pair, r in zip(pairs_to_scan, results):
             if isinstance(r, Exception):
                 logger.debug(f"SMC scan {pair} exception: {r}")
             elif isinstance(r, TradingSignal):
