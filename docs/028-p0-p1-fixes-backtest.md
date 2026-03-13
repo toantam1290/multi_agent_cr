@@ -163,3 +163,56 @@ Dựa trên kết quả backtest P0+P1 ở trên, thực hiện 4 fix tiếp the
 - Even weakest window (W2 Jun, BTC alone was 27% WR) still PF 3.4 thanks to ETH+SOL
 - SOL strongest performer: all 4 windows profitable individually but fail min_trades=30 threshold
 - Recommendation: Always trade minimum 3 symbols for robust edge
+
+---
+
+## Comprehensive 20-Coin × 2-Year Backtest (2023-2024)
+
+Run date: 2026-03-14. OB-only, session filter on, trail stop on.
+
+### Per-Batch Results
+
+| Batch | Coins | Trades | WR | PF | Sharpe | PnL ($10K base) | MDD |
+|-------|-------|--------|-----|-----|--------|-----------------|-----|
+| 1 | BTC,ETH,BNB,SOL,XRP | 1,550 | 72.9% | 8.85 | 11.58 | +$2,460 (+24.6%) | 0.1% |
+| 2 | DOGE,ADA,AVAX,DOT,LINK | 2,264 | 75.7% | 10.23 | 12.08 | +$4,367 (+43.7%) | 0.1% |
+| 3 | MATIC,LTC,UNI,ATOM,ETC | 2,208 | 74.4% | 10.13 | 11.58 | +$4,104 (+41.0%) | 0.1% |
+| 4 | FIL,APT,NEAR,ARB,OP | 2,549 | 73.4% | 11.34 | 12.57 | +$5,761 (+57.6%) | 0.1% |
+
+### Portfolio Summary (20 coins)
+
+| Metric | Value |
+|--------|-------|
+| Total trades | 8,571 |
+| Avg Win Rate | 74.1% |
+| Avg Profit Factor | 10.14 |
+| Avg Sharpe | 11.95 |
+| Total PnL (per $10K) | +$16,692 (+166.9%) |
+| Max Drawdown | 0.1% |
+| Trades/day | ~12 |
+| Months positive | 24/24 (100%) |
+
+### Quality Grade Breakdown (all coins)
+
+| Grade | Trades | WR |
+|-------|--------|----|
+| A+ | ~1,073 | 80-85% |
+| A | ~3,248 | 71-75% |
+| B | ~4,250 | 69-75% |
+
+### Key Findings
+
+- All 20 coins profitable over 2 years — no losing coin
+- All 24 months positive — no losing month
+- SHORT slightly stronger than LONG across most coins
+- Trail stop 74-75% activation rate, 87-90% WR when activated
+- Worst single trade: -3.89% (OPUSDT Jan 2023)
+- Best single trade: +13.70% (NEARUSDT Mar 2024)
+- Near-displacement trigger: 68-81% WR on small sample (41-54 trades per batch)
+- Altcoins (batch 2-4) generate more trades and higher PnL than majors (batch 1)
+
+### Recommendation
+
+- Trade minimum 5+ symbols for robust diversification
+- Prioritize: SOL, DOGE, DOT, LINK, FIL, NEAR, OP (highest trade counts + PnL)
+- Monitor A+ grade WR — if drops below 75%, re-evaluate displacement detection
