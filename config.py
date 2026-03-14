@@ -19,7 +19,7 @@ class TradingConfig:
     min_risk_reward: float = float(os.getenv("MIN_RISK_REWARD", "2.0"))
     approval_timeout_sec: int = int(os.getenv("APPROVAL_TIMEOUT_SEC", "300"))
     # Scalp override: confidence cao hơn (setup nhanh), timeout ngắn (setup fade nhanh)
-    scalp_min_confidence: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "80"))
+    scalp_min_confidence: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "55"))  # Match backtest (was 80)
     scalp_approval_timeout_sec: int = int(os.getenv("SCALP_APPROVAL_TIMEOUT_SEC", "120"))
     scalp_risk_reward_ratio: float = float(os.getenv("SCALP_RISK_REWARD_RATIO", "1.5"))
     paper_trading: bool = os.getenv("PAPER_TRADING", "true").lower() == "true"
@@ -89,6 +89,10 @@ class ScanConfig:
     scalp_whale_hours: int = int(os.getenv("SCALP_WHALE_HOURS", "1"))
     # RELAX_FILTER=true: nới filter để test pipeline (net_score 5/-5, bỏ volume/momentum). Chỉ dùng khi test!
     relax_filter: bool = os.getenv("RELAX_FILTER", "false").lower() == "true"
+    # EXTRA_SCALP_FILTERS=true: bật các hard gate chỉ có trong live (F&G, spread, CVD divergence,
+    # VWAP bias, EMA9 timing). Mặc định OFF để live khớp với backtest.
+    # Set EXTRA_SCALP_FILTERS=true nếu muốn strict hơn backtest.
+    use_extra_scalp_filters: bool = os.getenv("EXTRA_SCALP_FILTERS", "false").lower() == "true"
 
     def __post_init__(self):
         if self.trading_style is None or self.trading_style not in ("swing", "scalp"):

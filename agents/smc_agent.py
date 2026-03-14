@@ -36,7 +36,11 @@ class SMCAgent:
         self.telegram = telegram
         self.binance = BinanceDataFetcher()
         self.fear_greed = FearGreedFetcher()
-        self.strategy = SMCStrategy(self.binance)
+        self.strategy = SMCStrategy(
+            self.binance,
+            sl_buffer_pct=0.003,   # Match backtest config (was 0.005 constructor default)
+            min_rr_tp1=1.8,        # Match backtest config (was 1.5 constructor default)
+        )
 
         self._pair_semaphore = asyncio.Semaphore(3)
 
@@ -71,6 +75,11 @@ class SMCAgent:
                 # Pair cooldown — tránh duplicate signal cùng pair trong 30 phút
                 if self.db.had_recent_signal_for_pair(symbol, cooldown_sec=1800):
                     logger.info(f"SMCAgent {symbol}: Cooldown active (< 30m since last signal), skip")
+                    return None
+
+                # ob_entry_only — bpr(21%WR) và sweep(36%WR) là negative edge trên backtest
+                if setup.entry_model != "ob_entry":
+                    logger.info(f"SMCAgent {symbol}: skip {setup.entry_model} (ob_entry_only)")
                     return None
 
                 if isinstance(deriv, Exception):
@@ -115,7 +124,9 @@ class SMCAgent:
                     confluence_notes.append(cvd_note)
 
                 # Weighted average of point adjustments — additive, not multiplicative
-                if adjustments:
+                # Disabled by default để khớp backtest (backtest không có lớp này)
+                # Bật: EXTRA_SCALP_FILTERS=true
+                if adjustments and cfg.scan.use_extra_scalp_filters:
                     total_w = sum(weights)
                     raw_adj = sum(a * w for a, w in zip(adjustments, weights)) / total_w
                     capped_adj = max(-15, min(15, raw_adj))
@@ -134,8 +145,19 @@ class SMCAgent:
                 if confluence_notes:
                     setup.reasoning += " | Confluence: " + " | ".join(confluence_notes)
 
+                # Funding hard block — match backtest (hard gate ±0.05%)
+                if deriv and deriv.fetch_ok:
+                    fr = deriv.funding_rate
+                    if setup.direction == "LONG" and fr > 0.0005:
+                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} > 0.05% → skip LONG")
+                        return None
+                    if setup.direction == "SHORT" and fr < -0.0005:
+                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} < -0.05% → skip SHORT")
+                        return None
+
                 # F&G extreme — block LONG khi Greed (overbought), block SHORT khi Fear (oversold)
-                if style == "scalp":
+                # Disabled by default (EXTRA_SCALP_FILTERS=false) để khớp với backtest
+                if style == "scalp" and cfg.scan.use_extra_scalp_filters:
                     if setup.direction == "LONG" and fg > 75:
                         logger.info(f"SMCAgent {symbol}: F&G={fg} (Extreme Greed) → skip LONG scalp")
                         return None

@@ -106,6 +106,7 @@ class Database:
             "ALTER TABLE trades ADD COLUMN fees_usdt REAL",
             "ALTER TABLE signals ADD COLUMN cancel_reason TEXT",
             "ALTER TABLE trades ADD COLUMN sl_trailing_state TEXT DEFAULT 'original'",
+            "ALTER TABLE trades ADD COLUMN partial_pnl_usdt REAL DEFAULT 0.0",
         ]
         with self._write_lock:
             for sql in migrations:
@@ -307,6 +308,27 @@ class Database:
             )
             self.conn.commit()
 
+    def update_trade_partial_close(
+        self,
+        trade_id: str,
+        new_sl: float,
+        partial_pnl_usdt: float,
+        new_quantity: float,
+        new_position_size_usdt: float,
+        new_take_profit: float,
+    ):
+        """Partial close: chốt 50% position, move SL về entry, tighten TP cho 50% còn lại."""
+        with self._write_lock:
+            self.conn.execute(
+                """UPDATE trades SET
+                    stop_loss=?, sl_trailing_state='breakeven',
+                    partial_pnl_usdt=?, quantity=?, position_size_usdt=?,
+                    take_profit=?
+                   WHERE id=? AND status='OPEN'""",
+                (new_sl, partial_pnl_usdt, new_quantity, new_position_size_usdt, new_take_profit, trade_id),
+            )
+            self.conn.commit()
+
     def close_trade(
         self,
         trade_id: str,
@@ -317,12 +339,24 @@ class Database:
         pnl_pct: float,
         fees_usdt: float,
     ):
-        """Close trade (merge status + fees in single UPDATE, with lock). Idempotent: double-close safe."""
+        """Close trade (merge status + fees in single UPDATE, with lock). Idempotent: double-close safe.
+
+        Nếu trade đã partial close, pnl_usdt truyền vào là PnL của 50% còn lại.
+        Ta cộng thêm partial_pnl_usdt từ DB để ra tổng PnL thực.
+        """
         with self._write_lock:
+            # Lấy partial_pnl_usdt trước khi update
+            row = self.conn.execute(
+                "SELECT COALESCE(partial_pnl_usdt, 0) FROM trades WHERE id=? AND status='OPEN'",
+                (trade_id,)
+            ).fetchone()
+            partial_pnl = float(row[0]) if row else 0.0
+            total_pnl_usdt = pnl_usdt + partial_pnl
+
             cur = self.conn.execute("""
                 UPDATE trades SET status=?, closed_at=?, exit_price=?, pnl_usdt=?, pnl_pct=?, fees_usdt=?
                 WHERE id=? AND status='OPEN'
-            """, (status, closed_at, exit_price, pnl_usdt, pnl_pct, fees_usdt, trade_id))
+            """, (status, closed_at, exit_price, total_pnl_usdt, pnl_pct, fees_usdt, trade_id))
             self.conn.commit()
             if cur.rowcount == 0:
                 return  # Already closed (race: monitor vs circuit breaker)
@@ -330,14 +364,14 @@ class Database:
             self.ensure_daily_stats_row()
             d = datetime.now(timezone.utc).date().isoformat()
             try:
-                if pnl_usdt > 0:
+                if total_pnl_usdt > 0:
                     self.conn.execute(
                         "UPDATE daily_stats SET winning_trades = COALESCE(winning_trades, 0) + 1 WHERE date = ?",
                         (d,),
                     )
                 self.conn.execute(
                     "UPDATE daily_stats SET pnl_usdt = COALESCE(pnl_usdt, 0) + ? WHERE date = ?",
-                    (pnl_usdt, d),
+                    (total_pnl_usdt, d),
                 )
                 self.conn.commit()
             except sqlite3.OperationalError:

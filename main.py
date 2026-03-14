@@ -306,7 +306,7 @@ class TradingOrchestrator:
                     entry = t["entry_price"]
                     sl_state = t.get("sl_trailing_state") or "original"
 
-                    # Trail stop (scalp): move SL khi đang có lời
+                    # Trail stop + partial close (scalp)
                     if cfg.scan.trading_style == "scalp" and sl_state != "locked_50":
                         target_pct = (
                             (t["take_profit"] - entry) / entry * 100
@@ -322,7 +322,6 @@ class TradingOrchestrator:
                             current_sl = t["stop_loss"]
                             if unrealized_pnl_pct >= target_pct * 0.8:
                                 new_sl = entry + (current_price - entry) * 0.5 if direction == Direction.LONG else entry - (entry - current_price) * 0.5
-                                # Chỉ trail lên (LONG) hoặc xuống (SHORT), không bao giờ overwrite với SL tệ hơn
                                 if (direction == Direction.LONG and new_sl > current_sl) or (direction == Direction.SHORT and new_sl < current_sl):
                                     self.db.update_trade_sl(t["id"], new_sl, "locked_50")
                                     t["stop_loss"] = new_sl
@@ -331,13 +330,48 @@ class TradingOrchestrator:
                             elif unrealized_pnl_pct >= target_pct * 0.5 and sl_state == "original":
                                 new_sl = entry * 1.001 if direction == Direction.LONG else entry * 0.999
                                 if (direction == Direction.LONG and new_sl > current_sl) or (direction == Direction.SHORT and new_sl < current_sl):
-                                    self.db.update_trade_sl(t["id"], new_sl, "breakeven")
+                                    # Partial close: chốt 50% position tại current_price
+                                    FEE_PCT = 0.001
+                                    half_size = t["position_size_usdt"] * 0.5
+                                    half_qty  = t["quantity"] * 0.5
+                                    if direction == Direction.LONG:
+                                        partial_pnl = (current_price - entry) * half_qty
+                                    else:
+                                        partial_pnl = (entry - current_price) * half_qty
+                                    partial_pnl -= half_size * FEE_PCT  # fee cho 1 chiều close
+
+                                    # Tighten TP cho 50% còn lại: dùng 1.5x risk thay vì 2x
+                                    risk_abs = abs(entry - current_sl)
+                                    new_tp = (entry + risk_abs * 1.5) if direction == Direction.LONG else (entry - risk_abs * 1.5)
+
+                                    self.db.update_trade_partial_close(
+                                        trade_id=t["id"],
+                                        new_sl=new_sl,
+                                        partial_pnl_usdt=partial_pnl,
+                                        new_quantity=half_qty,
+                                        new_position_size_usdt=half_size,
+                                        new_take_profit=new_tp,
+                                    )
                                     t["stop_loss"] = new_sl
                                     t["sl_trailing_state"] = "breakeven"
-                                    logger.info(f"Trail stop: {t['pair']} SL → breakeven")
+                                    t["quantity"] = half_qty
+                                    t["position_size_usdt"] = half_size
+                                    t["take_profit"] = new_tp
+                                    logger.info(
+                                        f"Partial close: {t['pair']} chốt 50% @ {current_price:.4f} "
+                                        f"PnL=${partial_pnl:+.2f} | SL→entry | TP→{new_tp:.4f}"
+                                    )
+                                    await self.telegram.send_message(
+                                        f"✂️ *Partial Close* [PAPER]\n"
+                                        f"{t['pair']} {t['direction']}\n"
+                                        f"Chốt 50% @ `${current_price:,.4f}` | PnL: `${partial_pnl:+.2f}`\n"
+                                        f"SL → entry | TP → `${new_tp:,.4f}` (1.5R)"
+                                    )
 
                     # Time-based exit (scalp): không giữ quá 45 phút
-                    if cfg.scan.trading_style == "scalp" and t.get("opened_at"):
+                    # Sau partial close (sl_state=breakeven) → SL ở entry, house money → bỏ time limit
+                    partial_done = t.get("sl_trailing_state") in ("breakeven", "locked_50")
+                    if cfg.scan.trading_style == "scalp" and t.get("opened_at") and not partial_done:
                         try:
                             opened_at = datetime.fromisoformat(t["opened_at"].replace("Z", "+00:00"))
                             hold_minutes = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60

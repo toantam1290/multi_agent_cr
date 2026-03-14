@@ -48,7 +48,9 @@ import pandas_ta as ta
 # ─── Constants (mirror production config) ────────────────────────────────────
 
 FEE_PCT = 0.001          # 0.1% mỗi chiều
-SLIPPAGE_PCT = 0.0005    # 0.05% slippage khi fill
+SLIPPAGE_PCT = 0.0005    # 0.05% slippage khi fill (base, adjusted per exit type)
+SLIPPAGE_SL_PCT = 0.0015 # 0.15% SL exit slippage (market order hitting bid)
+SLIPPAGE_TP_PCT = 0.0005 # 0.05% TP exit slippage (limit order)
 SCALP_RR = 2.0
 SWING_RR = 2.0
 MAX_HOLD_CANDLES_SCALP = 9    # 9 × 5m = 45 phút
@@ -84,6 +86,7 @@ class BacktestConfig:
     use_dynamic_confluence: bool = True # Win rate < 45% → min_confluence=4
     use_sl_structure: bool = True
     use_trail_stop: bool = True
+    use_partial_close: bool = True   # Chốt 50% tại 1:1 RR, move SL về entry, phần còn lại chạy đến TP
     # Momentum gate: True = hard gate (phải có momentum mới pass),
     # False = momentum chỉ là bonus +15 vào net_score
     use_momentum_gate: bool = True
@@ -102,7 +105,7 @@ class BacktestConfig:
     smc_min_rr_tp1: float = 1.8      # Min R:R TP1 — tăng lọc setup chất lượng (was 1.5)
     smc_min_confidence: int = 55     # Min confidence — tăng filter (was 50)
     smc_sl_buffer_pct: float = 0.003  # SL buffer 0.3% — tránh wick hit (was 0.2%)
-    smc_ob_entry_only: bool = False   # Chỉ trade ob_entry, bỏ ce/sweep/bpr
+    smc_ob_entry_only: bool = True    # Chỉ trade ob_entry — bpr(21%WR) và sweep(36%WR) là negative edge
     smc_disable_ce_entry: bool = False  # No-op: ce_entry đã bị disable trong smc_strategy.py, giữ lại cho backward compat
     smc_min_grade: str = ""           # Chỉ grade A+ hoặc A: "A" | "" = không filter
     smc_displacement_only: bool = False  # Chỉ ltf_trigger=displacement, bỏ sweep/choch
@@ -817,15 +820,27 @@ def simulate_trade(
     use_trail_stop: bool = True,
     max_hold_candles: int = MAX_HOLD_CANDLES_SCALP,
     breakeven_candles: int = 0,
+    use_partial_close: bool = False,
+    partial_close_tp_mult: float = 1.5,
 ) -> tuple[str, float, float, int, str]:
     """
     Simulate trade outcome bằng cách replay từng candle tương lai.
-    
+
+    Partial close logic (use_partial_close=True):
+      Khi unrealized >= 50% of target (1:1 RR với RR=2):
+        - Chốt 50% position tại close candle đó
+        - Move SL về entry (breakeven cho 50% còn lại)
+        - TP cho 50% còn lại tighten về partial_close_tp_mult × risk (default 1.5×)
+      Final PnL = 0.5 * partial_pnl + 0.5 * remainder_pnl
+
     Returns: (outcome, exit_price, pnl_pct, hold_candles, sl_trailing_state)
     outcome: TP | SL | TIME_EXIT
     """
     current_sl = sl
     sl_state = "original"
+    partial_closed = False
+    partial_price = 0.0
+    current_tp = tp  # TP có thể thay đổi sau partial close
 
     if direction == "LONG":
         risk = entry - sl
@@ -839,10 +854,18 @@ def simulate_trade(
 
     target_pct = target / entry * 100
 
+    def _blended_pnl(remainder_price: float, remainder_outcome: str) -> float:
+        """50% tại partial_price + 50% tại remainder_price."""
+        p1 = _calc_pnl(direction, entry, partial_price, "TP")
+        p2 = _calc_pnl(direction, entry, remainder_price, remainder_outcome)
+        return 0.5 * p1 + 0.5 * p2
+
     for i, (idx, candle) in enumerate(future_df.iterrows()):
-        if i >= max_hold_candles:
+        # Time exit: chỉ áp dụng khi CHƯA partial close
+        # Sau partial close (SL = entry, house money) → không còn risk → để chạy tự nhiên đến TP
+        if i >= max_hold_candles and not partial_closed:
             exit_price = float(candle["close"])
-            pnl_pct = _calc_pnl(direction, entry, exit_price)
+            pnl_pct = _calc_pnl(direction, entry, exit_price, "TIME_EXIT")
             return "TIME_EXIT", exit_price, pnl_pct, i, sl_state
 
         # Break-even move: sau N candles move SL lên entry
@@ -858,10 +881,10 @@ def simulate_trade(
         # Check SL hit trước (conservative: giả sử xấu nhất trong candle)
         sl_hit = (direction == "LONG" and low <= current_sl) or \
                  (direction == "SHORT" and high >= current_sl)
-        tp_hit = (direction == "LONG" and high >= tp) or \
-                 (direction == "SHORT" and low <= tp)
+        tp_hit = (direction == "LONG" and high >= current_tp) or \
+                 (direction == "SHORT" and low <= current_tp)
 
-        # Trail stop logic (mirrors production)
+        # Trail stop + partial close logic (mirrors production)
         if use_trail_stop and sl_state != "locked_50":
             current_price_candle = float(candle["close"])
             if direction == "LONG":
@@ -876,38 +899,78 @@ def simulate_trade(
                    (direction == "SHORT" and new_sl < current_sl):
                     current_sl = new_sl
                     sl_state = "locked_50"
-            elif unrealized_pct >= target_pct * 0.35 and sl_state == "original":
+            elif unrealized_pct >= target_pct * 0.5 and sl_state == "original":
                 new_sl = entry * 1.001 if direction == "LONG" else entry * 0.999
                 if (direction == "LONG" and new_sl > current_sl) or \
                    (direction == "SHORT" and new_sl < current_sl):
                     current_sl = new_sl
                     sl_state = "breakeven"
+                # Partial close: chốt 50% tại close candle này, SL về entry
+                # Tighten TP cho 50% còn lại → partial_close_tp_mult × risk
+                if use_partial_close and not partial_closed:
+                    partial_closed = True
+                    partial_price = current_price_candle
+                    current_tp = (entry + risk * partial_close_tp_mult) if direction == "LONG" \
+                        else (entry - risk * partial_close_tp_mult)
 
         if sl_hit and tp_hit:
             # Ambiguous — assume SL hit (conservative)
             exit_price = current_sl
-            pnl_pct = _calc_pnl(direction, entry, exit_price)
+            if partial_closed:
+                pnl_pct = _blended_pnl(exit_price, "SL")
+            else:
+                pnl_pct = _calc_pnl(direction, entry, exit_price, "SL")
             return "SL", exit_price, pnl_pct, i + 1, sl_state
 
         if sl_hit:
             exit_price = current_sl
-            pnl_pct = _calc_pnl(direction, entry, exit_price)
+            if partial_closed:
+                pnl_pct = _blended_pnl(exit_price, "SL")
+            else:
+                pnl_pct = _calc_pnl(direction, entry, exit_price, "SL")
             return "SL", exit_price, pnl_pct, i + 1, sl_state
 
         if tp_hit:
-            pnl_pct = _calc_pnl(direction, entry, tp)
-            return "TP", tp, pnl_pct, i + 1, sl_state
+            if partial_closed:
+                pnl_pct = _blended_pnl(current_tp, "TP")
+            else:
+                pnl_pct = _calc_pnl(direction, entry, current_tp, "TP")
+            return "TP", current_tp, pnl_pct, i + 1, sl_state
 
     # Hết future data — exit tại close cuối
     last_close = float(future_df["close"].iloc[-1]) if len(future_df) > 0 else entry
-    pnl_pct = _calc_pnl(direction, entry, last_close)
+    if partial_closed:
+        pnl_pct = _blended_pnl(last_close, "TIME_EXIT")
+    else:
+        pnl_pct = _calc_pnl(direction, entry, last_close, "TIME_EXIT")
     return "TIME_EXIT", last_close, pnl_pct, len(future_df), sl_state
 
 
-def _calc_pnl(direction: str, entry: float, exit_price: float) -> float:
-    """PnL % sau fee cả 2 chiều."""
-    raw = (exit_price - entry) / entry * 100 if direction == "LONG" \
-        else (entry - exit_price) / entry * 100
+def _calc_pnl(direction: str, entry: float, exit_price: float,
+              exit_type: str = "") -> float:
+    """PnL % sau fee + slippage cả 2 chiều.
+
+    Slippage model:
+    - Entry: 0.03% (limit order inside OB zone)
+    - SL exit: 0.15% (market order hitting bid/ask)
+    - TP exit: 0.05% (limit order)
+    - TIME_EXIT: 0.10% (market order, moderate)
+    """
+    # Apply entry slippage (worse entry price)
+    entry_slip = entry * (1 + SLIPPAGE_PCT * (1 if direction == "LONG" else -1))
+
+    # Apply exit slippage based on exit type
+    if exit_type == "SL":
+        slip = SLIPPAGE_SL_PCT
+    elif exit_type == "TP":
+        slip = SLIPPAGE_TP_PCT
+    else:  # TIME_EXIT or unknown
+        slip = (SLIPPAGE_SL_PCT + SLIPPAGE_TP_PCT) / 2  # 0.10%
+
+    exit_slip = exit_price * (1 - slip * (1 if direction == "LONG" else -1))
+
+    raw = (exit_slip - entry_slip) / entry_slip * 100 if direction == "LONG" \
+        else (entry_slip - exit_slip) / entry_slip * 100
     fee = FEE_PCT * 2 * 100  # 0.2% round trip
     return raw - fee
 
@@ -942,12 +1005,12 @@ def run_backtest_for_symbol(
 
     if style == "scalp":
         step_tf = "15m"       # Scan mỗi nến 15m
-        df_fast_key = "15m"
-        df_slow_key = "5m"
+        df_fast_key = "1h"    # RSI 1h — match production ResearchAgent
+        df_slow_key = "4h"    # RSI 4h — match production ResearchAgent
         df_atr_key = "1h"     # ATR(1h) đủ lớn để cover fee; 5m quá nhỏ
         df_adx_key = "1h"
         df_trend_key = "4h"
-        max_hold = 12         # 12 × 5m = 60 phút, đủ để ATR(1h) move
+        max_hold = MAX_HOLD_CANDLES_SCALP  # 9 × 5m = 45 phút — match production
         future_tf = "5m"      # Simulate outcome trên 5m candles
     else:
         step_tf = "1h"
@@ -1204,6 +1267,7 @@ def run_backtest_for_symbol(
             direction, entry, sl, tp, future_candles,
             use_trail_stop=config.use_trail_stop,
             max_hold_candles=max_hold,
+            use_partial_close=config.use_partial_close,
         )
 
         # Approximate exit time
@@ -1284,7 +1348,7 @@ def run_smc_backtest_for_symbol(
         df_htf_key, df_htf_timing_key = "1h", "15m"
         df_ltf_key, df_ltf_timing_key = "15m", "5m"
         df_daily_key = "1d"
-        max_hold = 12
+        max_hold = MAX_HOLD_CANDLES_SCALP  # 9 × 5m = 45 phút — match production
         future_tf = "5m"
     else:
         step_tf = "1h"
@@ -1413,6 +1477,7 @@ def run_smc_backtest_for_symbol(
             use_trail_stop=config.use_trail_stop,
             max_hold_candles=max_hold,
             breakeven_candles=config.smc_breakeven_candles,
+            use_partial_close=config.use_partial_close,
         )
 
         exit_ts = future_candles.index[hold_candles - 1] if hold_candles < len(future_candles) else future_candles.index[-1]
@@ -1521,8 +1586,8 @@ def run_backtest_combined(
 
     style = config.style
     if style == "scalp":
-        step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "15m", "15m", "5m", "1h", "1h", "4h"
-        max_hold, future_tf = 12, "5m"  # 12×5m=60min match ATR(1h)
+        step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "15m", "1h", "4h", "1h", "1h", "4h"
+        max_hold, future_tf = MAX_HOLD_CANDLES_SCALP, "5m"  # 9×5m=45min — match production
     else:
         step_tf, df_fast_key, df_slow_key, df_atr_key, df_adx_key, df_trend_key = "1h", "1h", "4h", "1h", "4h", "1d"
         max_hold, future_tf = MAX_HOLD_CANDLES_SWING, "1h"
@@ -1698,6 +1763,7 @@ def run_backtest_combined(
                 direction, entry, sl, tp, future_candles,
                 use_trail_stop=config.use_trail_stop,
                 max_hold_candles=max_hold,
+                use_partial_close=config.use_partial_close,
             )
 
             exit_ts = future_candles.index[hold_candles - 1] if hold_candles < len(future_candles) else future_candles.index[-1]

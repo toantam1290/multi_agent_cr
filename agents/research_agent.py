@@ -226,7 +226,7 @@ class ResearchAgent:
             )
 
             # 1b. Scalp: spread check sớm — bỏ qua illiquid pair trước các bước tốn CPU
-            if style == "scalp" and not relax and spread_pct > 0.05:
+            if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters and spread_pct > 0.05:
                 logger.info(f"{pair}: Spread {spread_pct:.3f}% > 0.05%, skip")
                 self.db.log("research_agent", "INFO", f"Skip {pair}: spread", {"pair": pair, "spread": spread_pct})
                 return None, meta
@@ -241,7 +241,7 @@ class ResearchAgent:
             meta["rule_passed"] = True
 
             # 2a-pre. Scalp: F&G extreme — block LONG khi Extreme Fear, block SHORT khi Extreme Greed
-            if style == "scalp" and not relax:
+            if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters:
                 fg = sentiment.fear_greed_index
                 if direction == "LONG" and fg < 25:
                     logger.info(f"{pair}: F&G={fg} (Extreme Fear) → skip LONG scalp")
@@ -253,7 +253,7 @@ class ResearchAgent:
                     return None, meta
 
             # 2a. Scalp: CVD divergence — giá bullish nhưng seller đang dominate = fake move
-            if style == "scalp" and not relax:
+            if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters:
                 if direction == "LONG" and cvd["cvd_ratio"] < 0.52:
                     logger.info(f"{pair}: CVD divergence — price bullish but sellers dominating ({cvd['cvd_ratio']:.2f}), skip")
                     self.db.log("research_agent", "INFO", f"Skip {pair}: CVD divergence", {"pair": pair, "cvd_ratio": cvd["cvd_ratio"]})
@@ -264,7 +264,7 @@ class ResearchAgent:
                     return None, meta
 
             # 2b. Scalp: VWAP bias — LONG khi giá gần/dưới VWAP, SHORT khi gần/trên
-            if style == "scalp" and not relax:
+            if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters:
                 vd = technical.vwap_distance_pct
                 if direction == "LONG" and vd > 1.5:
                     logger.info(f"{pair}: Price {vd:.1f}% above VWAP — overextended, skip LONG")
@@ -274,7 +274,7 @@ class ResearchAgent:
                     return None, meta
 
             # 2c. Scalp: entry timing — cross EMA9 trong 3 nến gần nhất (nới hơn "just crossed")
-            if style == "scalp" and not relax:
+            if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters:
                 timing_ok = (
                     (direction == "LONG" and technical.ema9_crossed_recent_up)
                     or (direction == "SHORT" and technical.ema9_crossed_recent_down)
@@ -527,6 +527,9 @@ class ResearchAgent:
             )
             return signal, meta
 
+        except ValueError as e:
+            logger.warning(f"{pair}: {e} — skipping")
+            return None, meta
         except Exception as e:
             err_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             logger.exception(f"Error analyzing {pair}: {err_detail}")
