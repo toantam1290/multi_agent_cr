@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    container_name: trading-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # SQLite DB persist
+    ports:
+      - "8080:8080"               # Web UI (chỉ cần khi không dùng Cloudflare Tunnel)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8080/api/stats'); assert r.status_code == 200"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # Cloudflare Tunnel — truy cập web UI qua HTTPS không cần mở port
+  # Bỏ comment phần này sau khi có tunnel token
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel run
+  #   environment:
+  #     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+  #   depends_on:
+  #     - bot
