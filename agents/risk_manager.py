@@ -75,14 +75,15 @@ class RiskManagerAgent:
         return True, ""
 
     def _check_correlation(self, signal: TradingSignal, portfolio: PortfolioState) -> tuple[bool, str]:
-        """Không quá 2 vị thế cùng hướng — tránh 3× LONG exposure khi BTC dump"""
+        """Không quá N vị thế cùng hướng — tránh over-exposure khi BTC dump"""
         if not portfolio.open_trades:
             return True, ""
+        max_same_dir = self.cfg.max_open_positions // 2  # 50% mỗi hướng
         same_dir = sum(1 for t in portfolio.open_trades if t.direction.value == signal.direction.value)
-        if same_dir >= 2:
+        if same_dir >= max_same_dir:
             return False, (
                 f"{RiskRejectionReason.CORRELATION_RISK}: "
-                f"already {same_dir} {signal.direction.value} positions open"
+                f"already {same_dir}/{max_same_dir} {signal.direction.value} positions open"
             )
         return True, ""
 
