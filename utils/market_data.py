@@ -22,7 +22,7 @@ _RETRY_EXC = (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
 
 # Global rate limiter: max concurrent HTTP requests (tránh Binance 429/418 IP ban)
 # Binance futures: 2400 weight/min. Semaphore 8 giới hạn burst, backoff khi 429/418
-_GLOBAL_HTTP_SEMAPHORE = asyncio.Semaphore(8)
+_GLOBAL_HTTP_SEMAPHORE = asyncio.Semaphore(5)
 _rate_limit_backoff: float = 0  # seconds, tăng khi gặp 429/418
 
 
@@ -114,6 +114,8 @@ class BinanceDataFetcher:
         self._futures_data_base = self.FUTURES_DATA_BASE
         # Cache valid futures symbols — populated by get_premium_index_full()
         self._futures_symbols: set[str] = set()
+        # Auto-blacklist symbols that return 400 on openInterest (settled/delisted)
+        self._oi_blacklist: set[str] = set()
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
         """Lấy candlestick data (có retry khi timeout/connection)."""
@@ -357,9 +359,10 @@ class BinanceDataFetcher:
 
     async def get_derivatives_signal(self, symbol: str) -> DerivativesSignal:
         """Funding + OI + basis → DerivativesSignal. premiumIndex 1 lần (tránh gọi 2x)."""
-        # Skip delisted futures pairs — tránh 400 Bad Request thừa
+        # Skip delisted/settled futures pairs — tránh 400 Bad Request thừa
         if self._futures_symbols and symbol not in self._futures_symbols:
-            logger.debug(f"Derivatives skip ({symbol}): not in futures symbols")
+            return DerivativesSignal(funding_rate=0.0005, fetch_ok=False)
+        if symbol in self._oi_blacklist:
             return DerivativesSignal(funding_rate=0.0005, fetch_ok=False)
         try:
             # premiumIndex 1 call → funding + mark + index; openInterest riêng (có retry)
@@ -375,6 +378,11 @@ class BinanceDataFetcher:
                     params={"symbol": symbol},
                 ),
             )
+            # Auto-blacklist symbols returning 400 (settled/delisted but still in premiumIndex)
+            if oi_resp.status_code == 400:
+                self._oi_blacklist.add(symbol)
+                logger.info(f"Derivatives ({symbol}): OI returned 400, auto-blacklisted")
+                return DerivativesSignal(funding_rate=0.0005, fetch_ok=False)
             prem_resp.raise_for_status()
             oi_resp.raise_for_status()
 
@@ -818,6 +826,8 @@ def get_opportunity_pairs(
         symbol = t.get("symbol") or ""
         if not symbol.endswith("USDT"):
             continue
+        if not symbol.isascii():
+            continue  # Skip non-ASCII symbols (e.g. 龙虾USDT)
         if symbol in blacklist_set:
             continue
         if symbol in symbols_in_cooldown:
