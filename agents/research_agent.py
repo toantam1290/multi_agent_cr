@@ -240,16 +240,16 @@ class ResearchAgent:
 
             meta["rule_passed"] = True
 
-            # 2a-pre. Scalp: F&G extreme — block LONG khi Extreme Fear, block SHORT khi Extreme Greed
+            # 2a-pre. Scalp: F&G extreme — block LONG khi Extreme Greed (overbought), block SHORT khi Extreme Fear (oversold)
             if style == "scalp" and not relax and cfg.scan.use_extra_scalp_filters:
                 fg = sentiment.fear_greed_index
-                if direction == "LONG" and fg < 25:
-                    logger.info(f"{pair}: F&G={fg} (Extreme Fear) → skip LONG scalp")
-                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme", {"fg": fg})
+                if direction == "LONG" and fg > 75:
+                    logger.info(f"{pair}: F&G={fg} (Extreme Greed) → skip LONG scalp (overbought)")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme greed", {"fg": fg})
                     return None, meta
-                if direction == "SHORT" and fg > 75:
-                    logger.info(f"{pair}: F&G={fg} (Extreme Greed) → skip SHORT scalp")
-                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme", {"fg": fg})
+                if direction == "SHORT" and fg < 25:
+                    logger.info(f"{pair}: F&G={fg} (Extreme Fear) → skip SHORT scalp (oversold)")
+                    self.db.log("research_agent", "INFO", f"Skip {pair}: F&G extreme fear", {"fg": fg})
                     return None, meta
 
             # 2a. Scalp: CVD divergence — giá bullish nhưng seller đang dominate = fake move
@@ -707,10 +707,12 @@ DATA:
 
     async def _get_available_balance(self) -> float:
         """Lấy available balance (trừ locked capital trong open positions)"""
+        cumulative_pnl = self.db.get_cumulative_pnl()
         if cfg.trading.paper_trading:
-            total = cfg.trading.paper_balance_usdt
+            total = cfg.trading.paper_balance_usdt + cumulative_pnl
         else:
-            total = 10000.0  # TODO: Fetch from Binance
+            # TODO: Thay bằng fetch balance thực từ Binance futures_account_balance()
+            total = 10000.0 + cumulative_pnl
         open_trades = self.db.get_open_trades()
         locked = sum(t["position_size_usdt"] for t in open_trades)
         return max(0.0, total - locked)

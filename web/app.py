@@ -102,6 +102,37 @@ async def api_opportunity():
     return {"config": config, "last_funnel": last_funnel, "last_funnel_time": last_funnel_time}
 
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint — dùng cho external monitoring (UptimeRobot, Prometheus)."""
+    from datetime import datetime, timezone, timedelta
+    last_scan_at = db.get_system_state("last_scan_at")
+    now = datetime.now(timezone.utc)
+    status = "ok"
+    stale = False
+    if last_scan_at:
+        try:
+            last_scan = datetime.fromisoformat(last_scan_at)
+            if last_scan.tzinfo is None:
+                last_scan = last_scan.replace(tzinfo=timezone.utc)
+            # Stale nếu không scan trong 30 phút (swing) hoặc 10 phút (scalp)
+            max_gap = timedelta(minutes=30)
+            if (now - last_scan) > max_gap:
+                status = "degraded"
+                stale = True
+        except Exception:
+            pass
+    else:
+        status = "starting"
+    return {
+        "status": status,
+        "last_scan_at": last_scan_at or None,
+        "stale": stale,
+        "timestamp": now.isoformat(),
+        "paper_trading": cfg.trading.paper_trading,
+    }
+
+
 @app.get("/api/daily-dashboard")
 async def api_daily_dashboard(days: int = 7):
     """Daily metrics + quality score (spec 006)."""

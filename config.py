@@ -139,6 +139,10 @@ class AppConfig:
         if not self.trading.paper_trading:
             if not self.binance.api_key:
                 errors.append("BINANCE_API_KEY chưa set (bắt buộc khi paper_trading=false)")
+            if not self.binance.api_secret:
+                errors.append("BINANCE_API_SECRET chưa set (bắt buộc khi paper_trading=false)")
+            if self.scan.relax_filter:
+                errors.append("RELAX_FILTER=true không được dùng trong live trading — tắt ngay!")
         # Opportunity screening validation
         self._validate_scan(errors)
         if errors:

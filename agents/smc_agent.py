@@ -145,14 +145,15 @@ class SMCAgent:
                 if confluence_notes:
                     setup.reasoning += " | Confluence: " + " | ".join(confluence_notes)
 
-                # Funding hard block — match backtest (hard gate ±0.05%)
+                # Funding hard block — chỉ block khi funding CỰC ĐOAN (>0.10%)
+                # Funding elevated (0.05%-0.10%) đã được xử lý bởi soft penalty trong crypto_confluence
                 if deriv and deriv.fetch_ok:
                     fr = deriv.funding_rate
-                    if setup.direction == "LONG" and fr > 0.0005:
-                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} > 0.05% → skip LONG")
+                    if setup.direction == "LONG" and fr > 0.001:  # >0.10% = cực đoan
+                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} > 0.10% → skip LONG (extreme)")
                         return None
-                    if setup.direction == "SHORT" and fr < -0.0005:
-                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} < -0.05% → skip SHORT")
+                    if setup.direction == "SHORT" and fr < -0.001:  # <-0.10% = cực đoan
+                        logger.info(f"SMCAgent {symbol}: funding={fr:.4%} < -0.10% → skip SHORT (extreme)")
                         return None
 
                 # F&G extreme — block LONG khi Greed (overbought), block SHORT khi Fear (oversold)

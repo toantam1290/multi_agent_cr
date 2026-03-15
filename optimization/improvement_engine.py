@@ -59,12 +59,25 @@ class ImprovementEngine:
         self._value_idx: Dict[int, int] = {}
 
     def _bottleneck_candidate(self, met: MetricsResult, candidates: List) -> int:
-        """Chọn param nào cần tune dựa trên bottleneck."""
-        if met.avg_rr < 1.5 or met.profit_factor < 1.2:
-            return 1 % len(candidates)
-        if met.win_rate < 0.38:
+        """Chọn param nào cần tune dựa trên bottleneck thực sự."""
+        if not candidates:
             return 0
-        return 2 % len(candidates)
+        # Bottleneck RR thấp → ưu tiên param liên quan đến RR
+        if met.avg_rr < 1.5 or met.profit_factor < 1.2:
+            for i, c in enumerate(candidates):
+                if "rr" in str(c).lower():
+                    return i
+        # Bottleneck win rate thấp → ưu tiên param liên quan đến confidence/filter
+        if met.win_rate < 0.38:
+            for i, c in enumerate(candidates):
+                if "confidence" in str(c).lower() or "min" in str(c).lower():
+                    return i
+        # Default: round-robin để explore tất cả params thay vì fix cứng index
+        if not hasattr(self, "_candidate_cursor"):
+            self._candidate_cursor = 0
+        idx = self._candidate_cursor % len(candidates)
+        self._candidate_cursor += 1
+        return idx
 
     def _run_backtest(
         self,

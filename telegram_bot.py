@@ -137,20 +137,40 @@ class TelegramNotifier:
             return
 
         short_id = args[0].strip()
-        signal_data = self.db.get_signal_by_short_id(short_id)
 
-        if not signal_data:
-            await update.message.reply_text(f"❌ Signal not found: {short_id}")
-            return
+        # Pop ngay lập tức (atomic) — tránh double-approve race khi user bấm 2 lần
+        signal = self._pending_signals.pop(short_id, None)
 
-        # Lấy từ _pending_signals hoặc DB (recovery sau restart)
-        if short_id in self._pending_signals:
-            signal = self._pending_signals.pop(short_id)
-        elif signal_data.get("status") == "PENDING":
+        if signal is None:
+            # Fallback: DB recovery path (sau process restart)
+            signal_data = self.db.get_signal_by_short_id(short_id)
+            if not signal_data:
+                await update.message.reply_text(f"❌ Signal not found: {short_id}")
+                return
+            if signal_data.get("status") != "PENDING":
+                await update.message.reply_text(f"⚠️ Signal {short_id} already processed or expired")
+                return
+            # Kiểm tra tuổi signal — reject nếu quá timeout (stale signal sau restart)
+            created_str = signal_data.get("created_at", "")
+            if created_str:
+                from datetime import timezone as _tz
+                try:
+                    created = datetime.fromisoformat(created_str)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=_tz.utc)
+                    age_sec = (datetime.now(_tz.utc) - created).total_seconds()
+                    timeout = get_effective_approval_timeout_sec()
+                    if age_sec > timeout:
+                        self.db.update_signal_status(
+                            signal_data["id"], SignalStatus.SKIPPED, cancel_reason="timeout"
+                        )
+                        await update.message.reply_text(
+                            f"⏰ Signal {short_id} đã hết hạn ({int(age_sec)}s > {timeout}s)"
+                        )
+                        return
+                except Exception:
+                    pass
             signal = TradingSignal.model_validate(signal_data)
-        else:
-            await update.message.reply_text(f"⚠️ Signal {short_id} already processed or expired")
-            return
         self.db.update_signal_status(signal.id, SignalStatus.APPROVED)
 
         await update.message.reply_text(

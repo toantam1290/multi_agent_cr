@@ -408,8 +408,9 @@ class SMCAnalyzer:
         highs, lows = [], []
         for i in range(n, len(df)):
             right_bound = min(i + n + 1, len(df))
-            # Yêu cầu ít nhất 2 nến bên phải để tránh false swing ở biên
-            if right_bound - i < 2 and i < len(df) - 1:
+            # Cần đủ n nến bên phải để confirm swing — tránh false swing ở right edge
+            right_count = right_bound - i - 1
+            if right_count < n:
                 continue
             window_h = df["high"].iloc[i - n : right_bound]
             window_l = df["low"].iloc[i - n : right_bound]
@@ -433,7 +434,9 @@ class SMCAnalyzer:
         prev_sh = float(df["high"].iloc[swing_highs[-2]])
         last_sl = float(df["low"].iloc[swing_lows[-1]])
         prev_sl = float(df["low"].iloc[swing_lows[-2]])
-        current = float(df["close"].iloc[-2])  # nến đã đóng — tránh false signal
+        # Dùng high/low của nến đã đóng để detect BoS — close ít khi vượt swing high/low
+        current_high = float(df["high"].iloc[-2])   # nến đã đóng
+        current_low = float(df["low"].iloc[-2])      # nến đã đóng
 
         hh = last_sh > prev_sh
         hl = last_sl > prev_sl
@@ -444,23 +447,23 @@ class SMCAnalyzer:
 
         if hh and hl:
             bias = "BULLISH"
-            if current > last_sh:
+            if current_high > last_sh:  # high vượt swing high = BoS bullish confirmed
                 last_event = "BoS_bull"
-                strength = (current - last_sh) / last_sh * 100
+                strength = (current_high - last_sh) / last_sh * 100
         elif ll and lh:
             bias = "BEARISH"
-            if current < last_sl:
+            if current_low < last_sl:   # low xuyên swing low = BoS bearish confirmed
                 last_event = "BoS_bear"
-                strength = (last_sl - current) / last_sl * 100
+                strength = (last_sl - current_low) / last_sl * 100
         else:
-            if current > last_sh:
+            if current_high > last_sh:
                 bias = "BULLISH"
                 last_event = "CHoCH_bull"
-                strength = (current - last_sh) / last_sh * 100
-            elif current < last_sl:
+                strength = (current_high - last_sh) / last_sh * 100
+            elif current_low < last_sl:
                 bias = "BEARISH"
                 last_event = "CHoCH_bear"
-                strength = (last_sl - current) / last_sl * 100
+                strength = (last_sl - current_low) / last_sl * 100
 
         return bias, last_event, round(strength, 3)
 
@@ -681,6 +684,8 @@ class SMCAnalyzer:
         BPR (Balanced Price Range): bullish FVG và bearish FVG overlap nhau.
         Vùng overlap = institutional sweet spot. Trả về (has_bpr, overlap_top, overlap_bottom).
         """
+        # Duyệt tất cả cặp và trả về BPR GẦN NHẤT (mới nhất) — không phải đầu tiên tìm thấy
+        last_top, last_bottom = None, None
         for bf in bull_fvgs:
             if bf.filled:
                 continue
@@ -690,7 +695,10 @@ class SMCAnalyzer:
                 overlap_bottom = max(bf.bottom, baf.bottom)
                 overlap_top = min(bf.top, baf.top)
                 if overlap_top > overlap_bottom:
-                    return True, overlap_top, overlap_bottom
+                    last_top = overlap_top
+                    last_bottom = overlap_bottom
+        if last_top is not None:
+            return True, last_top, last_bottom
         return False, None, None
 
     def _detect_premium_discount(
@@ -709,8 +717,15 @@ class SMCAnalyzer:
 
         last_sh_idx = swing_highs[-1]
         last_sl_idx = swing_lows[-1]
-        sh = float(df["high"].iloc[last_sh_idx])
-        sl = float(df["low"].iloc[last_sl_idx])
+        # Dùng swing leg gần nhất (coherent pair) thay vì lấy SH và SL độc lập
+        if last_sh_idx > last_sl_idx:
+            # Bullish leg: SL → SH (giá đang tăng từ SL lên SH)
+            sh = float(df["high"].iloc[last_sh_idx])
+            sl = float(df["low"].iloc[last_sl_idx])
+        else:
+            # Bearish leg: SH → SL (giá đang giảm từ SH xuống SL)
+            sh = float(df["high"].iloc[last_sh_idx])
+            sl = float(df["low"].iloc[last_sl_idx])
 
         if sh <= sl:
             return None

@@ -16,6 +16,9 @@ class Database:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL mode: tránh "database is locked" khi web thread đọc song song với async writes
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self._write_lock = threading.RLock()  # Reentrant (ensure_daily_stats_row gọi từ add_anthropic_spend)
         self._create_tables()
         self.migrate()
@@ -93,6 +96,13 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair);
             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair);
+            CREATE INDEX IF NOT EXISTS idx_agent_logs_ts ON agent_logs(timestamp);
+
+            CREATE TABLE IF NOT EXISTS system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         self.conn.commit()
 
@@ -254,8 +264,9 @@ class Database:
         return [json.loads(r["raw_json"]) for r in rows]
 
     def get_signal_by_short_id(self, short_id: str) -> Optional[dict]:
+        # Dùng exact match trên 8 ký tự đầu — tránh approve nhầm signal khi có prefix collision
         row = self.conn.execute(
-            "SELECT raw_json FROM signals WHERE id LIKE ?", (f"{short_id}%",)
+            "SELECT raw_json FROM signals WHERE substr(id, 1, 8) = ?", (short_id[:8],)
         ).fetchone()
         return json.loads(row["raw_json"]) if row else None
 
@@ -457,6 +468,10 @@ class Database:
                 (datetime.now(timezone.utc).isoformat(), agent, level, message,
                  json.dumps(data) if data else None)
             )
+            # Xóa logs cũ hơn 30 ngày để tránh table bloat
+            self.conn.execute(
+                "DELETE FROM agent_logs WHERE datetime(timestamp) < datetime('now', '-30 days')"
+            )
             self.conn.commit()
 
     def get_recent_logs(self, limit: int = 100) -> list[dict]:
@@ -504,6 +519,24 @@ class Database:
                 (symbol, last_scanned_at, last_seen_volatility, 1 if in_opportunity else 0, now),
             )
             self.conn.commit()
+
+    # ─── System State (circuit breaker persistence, health) ──────────────────
+
+    def set_system_state(self, key: str, value: str) -> None:
+        """Lưu trạng thái hệ thống vào DB (persist qua restart)."""
+        with self._write_lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                (key, value)
+            )
+            self.conn.commit()
+
+    def get_system_state(self, key: str, default: str = "") -> str:
+        """Đọc trạng thái hệ thống từ DB."""
+        row = self.conn.execute(
+            "SELECT value FROM system_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row else default
 
     def close(self):
         self.conn.close()

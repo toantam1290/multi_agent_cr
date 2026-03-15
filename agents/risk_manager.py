@@ -123,11 +123,21 @@ class RiskManagerAgent:
             )
         # Cũng check vs max portfolio pct
         max_size = portfolio.total_usdt * self.cfg.max_position_pct
-        if signal.position_size_usdt > max_size * 1.05:  # 5% tolerance
+        if signal.position_size_usdt > max_size * 1.005:  # 0.5% tolerance — tránh lỗi floating point
             return False, (
                 f"{RiskRejectionReason.POSITION_TOO_LARGE}: "
                 f"${signal.position_size_usdt:.0f} > {self.cfg.max_position_pct*100}% of portfolio"
             )
+        # Cảnh báo ATR-normalized risk: risk thực tế = (entry - SL) / entry * position_size
+        if signal.entry_price and signal.stop_loss:
+            sl_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
+            actual_risk_usdt = signal.position_size_usdt * sl_distance_pct
+            max_risk_usdt = portfolio.total_usdt * 0.01  # Max 1% equity per trade
+            if actual_risk_usdt > max_risk_usdt * 1.2:
+                logger.warning(
+                    f"Risk thực tế ${actual_risk_usdt:.2f} USDT vượt 1% equity "
+                    f"(${max_risk_usdt:.2f} USDT) — SL quá rộng so với position size"
+                )
         return True, ""
 
     def get_portfolio_state(self) -> PortfolioState:

@@ -56,6 +56,21 @@ class TradingOrchestrator:
         self._circuit_breaker_triggered = False
         self._circuit_breaker_date: date | None = None  # Ngày trigger để reset khi qua ngày mới
         self._circuit_breaker_triggered_at: datetime | None = None
+        # Khôi phục trạng thái circuit breaker từ DB sau restart
+        _cb_triggered = self.db.get_system_state("cb_triggered")
+        _cb_date_str = self.db.get_system_state("cb_date")
+        if _cb_triggered == "1" and _cb_date_str:
+            try:
+                _cb_date = date.fromisoformat(_cb_date_str)
+                if _cb_date == date.today():
+                    self._circuit_breaker_triggered = True
+                    self._circuit_breaker_date = _cb_date
+                    _at_str = self.db.get_system_state("cb_triggered_at")
+                    if _at_str:
+                        self._circuit_breaker_triggered_at = datetime.fromisoformat(_at_str)
+                    logger.warning("Circuit breaker vẫn đang active từ trước restart — scanner sẽ tiếp tục tạm dừng")
+            except Exception:
+                pass
 
     async def start(self):
         """Khởi động toàn bộ hệ thống"""
@@ -139,13 +154,15 @@ class TradingOrchestrator:
             misfire_grace_time=300,
             coalesce=True,
         )
-        # SMC standalone scan — chạy riêng, độc lập với research_scan
+        # SMC standalone scan — chạy riêng, stagger 50% interval để tránh rate limit
         smc_interval_min = 5 if cfg.scan.trading_style == "scalp" else 15
+        smc_delay_sec = smc_interval_min * 60 // 2  # 2.5 phút delay (stagger với research)
         self.scheduler.add_job(
             self._smc_scan,
             "interval",
             minutes=smc_interval_min,
             id="smc_scan",
+            next_run_time=datetime.now() + timedelta(seconds=smc_delay_sec),
             misfire_grace_time=max(300, smc_interval_min * 60),
             coalesce=True,
         )
@@ -196,6 +213,7 @@ class TradingOrchestrator:
             for signal in signals:
                 await self._process_signal(signal)
 
+            self.db.set_system_state("last_scan_at", datetime.now(timezone.utc).isoformat())
             logger.info(f"Market scan done ({len(signals)} signals)")
         except Exception as e:
             logger.error(f"Market scan error: {e}")
@@ -355,6 +373,7 @@ class TradingOrchestrator:
                                     t["stop_loss"] = new_sl
                                     t["sl_trailing_state"] = "breakeven"
                                     t["quantity"] = half_qty
+                                    t["original_position_size_usdt"] = t["position_size_usdt"]  # Lưu trước khi halve — dùng để tính pnl_pct chính xác
                                     t["position_size_usdt"] = half_size
                                     t["take_profit"] = new_tp
                                     logger.info(
@@ -432,7 +451,9 @@ class TradingOrchestrator:
                         fee_cost = t["position_size_usdt"] * FEE_PCT * 2
                         pnl = pnl - fee_cost
 
-                        pnl_pct = pnl / t["position_size_usdt"] * 100
+                        # Dùng original size (trước partial close) để pnl_pct không bị inflate 2x
+                        orig_size = t.get("original_position_size_usdt", t["position_size_usdt"])
+                        pnl_pct = pnl / orig_size * 100
                         status = TradeStatus.STOPPED if hit_sl else TradeStatus.TOOK_PROFIT
 
                         self.db.close_trade(
@@ -465,9 +486,9 @@ class TradingOrchestrator:
         today = datetime.now(timezone.utc).date()
         daily_pnl = self.db.get_daily_pnl()
 
-        # Tính unrealized PnL từ open positions
+        # Tính unrealized PnL từ open positions (cả paper và live — circuit breaker phải chính xác)
         open_trades = self.db.get_open_trades()
-        if open_trades and cfg.trading.paper_trading:
+        if open_trades:
             from utils.market_data import BinanceDataFetcher
             fetcher = BinanceDataFetcher()
             try:
@@ -494,6 +515,7 @@ class TradingOrchestrator:
             self._circuit_breaker_triggered = False
             self._circuit_breaker_date = None
             self._circuit_breaker_triggered_at = None
+            self.db.set_system_state("cb_triggered", "0")  # Xóa trạng thái CB trong DB
             self.scheduler.resume_job("market_scan")
             self.scheduler.resume_job("smc_scan")
             logger.info("Circuit breaker: Resumed market scan (new day)")
@@ -508,6 +530,7 @@ class TradingOrchestrator:
                 if elapsed >= timedelta(hours=1):
                     self._circuit_breaker_triggered = False
                     self._circuit_breaker_date = None
+                    self.db.set_system_state("cb_triggered", "0")  # Xóa trạng thái CB trong DB
                     self.scheduler.resume_job("market_scan")
                     self.scheduler.resume_job("smc_scan")
                     logger.info("Circuit breaker: Resumed (PnL recovered past 50% threshold)")
@@ -519,6 +542,10 @@ class TradingOrchestrator:
                 self._circuit_breaker_triggered = True
                 self._circuit_breaker_date = today
                 self._circuit_breaker_triggered_at = datetime.now(timezone.utc)
+                # Persist CB state để survive restart
+                self.db.set_system_state("cb_triggered", "1")
+                self.db.set_system_state("cb_date", today.isoformat())
+                self.db.set_system_state("cb_triggered_at", self._circuit_breaker_triggered_at.isoformat())
                 self.scheduler.pause_job("market_scan")
                 self.scheduler.pause_job("smc_scan")
                 logger.warning(f"CIRCUIT BREAKER: Daily loss ${daily_pnl:.2f} exceeded limit ${-max_loss:.2f}")

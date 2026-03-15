@@ -77,7 +77,7 @@ class BacktestConfig:
     use_confluence_filter: bool = True
     use_cvd_proxy: bool = True   # volume-based CVD proxy
     use_vwap_filter: bool = True
-    use_session_filter: bool = True
+    use_session_filter: bool = False  # Production chạy 24/7 — backtest phải match (không filter session)
     use_regime_filter: bool = True
     use_chop_filter: bool = True       # Chop Index > 61.8 → skip (scalp)
     use_smc_filter: bool = True        # SMC opposing + confluence + OB override
@@ -105,7 +105,7 @@ class BacktestConfig:
     smc_min_rr_tp1: float = 1.8      # Min R:R TP1 — tăng lọc setup chất lượng (was 1.5)
     smc_min_confidence: int = 55     # Min confidence — tăng filter (was 50)
     smc_sl_buffer_pct: float = 0.003  # SL buffer 0.3% — tránh wick hit (was 0.2%)
-    smc_ob_entry_only: bool = True    # Chỉ trade ob_entry — bpr(21%WR) và sweep(36%WR) là negative edge
+    smc_ob_entry_only: bool = True    # ob_entry: 61%WR 2.51RR — bpr(23%WR) và sweep(33%WR) là negative edge
     smc_disable_ce_entry: bool = False  # No-op: ce_entry đã bị disable trong smc_strategy.py, giữ lại cho backward compat
     smc_min_grade: str = ""           # Chỉ grade A+ hoặc A: "A" | "" = không filter
     smc_displacement_only: bool = False  # Chỉ ltf_trigger=displacement, bỏ sweep/choch

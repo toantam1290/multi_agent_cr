@@ -20,19 +20,66 @@ RETRY_MAX = 3
 RETRY_DELAYS = (1, 2, 3)
 _RETRY_EXC = (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError)
 
+# Global rate limiter: max concurrent HTTP requests (tránh Binance 429/418 IP ban)
+# Binance futures: 2400 weight/min. Semaphore 8 giới hạn burst, backoff khi 429/418
+_GLOBAL_HTTP_SEMAPHORE = asyncio.Semaphore(8)
+_rate_limit_backoff: float = 0  # seconds, tăng khi gặp 429/418
+
+
+class RateLimitedClient:
+    """Wrapper httpx.AsyncClient — mọi .get() đi qua global semaphore + auto backoff."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self._inner = client
+
+    async def get(self, url: str, params: dict | None = None, **kwargs) -> httpx.Response:
+        global _rate_limit_backoff
+        async with _GLOBAL_HTTP_SEMAPHORE:
+            if _rate_limit_backoff > 0:
+                await asyncio.sleep(_rate_limit_backoff)
+            resp = await self._inner.get(url, params=params, **kwargs)
+            if resp.status_code in (429, 418):
+                _rate_limit_backoff = min(30, _rate_limit_backoff + 5) if _rate_limit_backoff else 10
+                logger.warning(
+                    f"Rate limited ({resp.status_code}), backoff {_rate_limit_backoff:.0f}s: "
+                    f"{url.split('/')[-1].split('?')[0]}"
+                )
+                await asyncio.sleep(_rate_limit_backoff)
+            elif _rate_limit_backoff > 0:
+                _rate_limit_backoff = max(0, _rate_limit_backoff - 1)  # Gradually reduce
+            return resp
+
+    # Proxy other attributes to inner client
+    async def aclose(self):
+        await self._inner.aclose()
+
+    @property
+    def is_closed(self):
+        return self._inner.is_closed
+
+
+def _create_client() -> RateLimitedClient:
+    """Tạo rate-limited HTTP client cho Binance API."""
+    return RateLimitedClient(httpx.AsyncClient(timeout=HTTP_TIMEOUT))
+
 
 async def _http_get_with_retry(
-    client: httpx.AsyncClient,
+    client: RateLimitedClient | httpx.AsyncClient,
     url: str,
     params: Optional[dict] = None,
     max_retries: int = RETRY_MAX,
     delays: tuple = RETRY_DELAYS,
 ) -> httpx.Response:
-    """GET với retry khi gặp ConnectTimeout / ReadTimeout / ConnectError."""
+    """GET với retry khi gặp ConnectTimeout / ReadTimeout / ConnectError / 429 / 418."""
     last: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
-            return await client.get(url, params=params or {})
+            resp = await client.get(url, params=params or {})
+            # Rate limit: retry nếu còn attempt
+            if resp.status_code in (429, 418) and attempt < max_retries - 1:
+                await asyncio.sleep(min(15, 5 * (attempt + 1)))
+                continue
+            return resp
         except _RETRY_EXC as e:
             last = e
             if attempt < max_retries - 1:
@@ -61,7 +108,7 @@ class BinanceDataFetcher:
     def __init__(self):
         # Data luôn dùng mainnet (testnet giá giả, derivatives đã mainnet → inconsistent)
         self.base = self.FUTURES_BASE
-        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+        self._client = _create_client()
         # Futures data luôn dùng mainnet (testnet futures ít liquidity)
         self._futures_base = self.FUTURES_BASE
         self._futures_data_base = self.FUTURES_DATA_BASE
@@ -190,7 +237,7 @@ class BinanceDataFetcher:
         24h ticker stats. use_futures=True: futures price (cho OI×Price logic, khớp với derivatives).
         """
         base_url = self._futures_base if use_futures else self.base
-        resp = await self._client.get(f"{base_url}/ticker/24hr", params={"symbol": symbol})
+        resp = await _http_get_with_retry(self._client, f"{base_url}/ticker/24hr", params={"symbol": symbol})
         resp.raise_for_status()
         d = resp.json()
         return {
@@ -363,6 +410,8 @@ class BinanceDataFetcher:
 
         logger.info(f"Computing technical signals for {symbol} ({style})")
 
+        import pandas as _pd  # Local import tránh Python 3.12 nested scope issue với pd
+
         if style == "swing":
             df_fast, df_slow, df_trend = await asyncio.gather(
                 self.get_klines(symbol, "1h", 100),
@@ -392,16 +441,16 @@ class BinanceDataFetcher:
         if style == "scalp" and (len(df_atr) < min_rows or len(df_adx) < min_rows):
             raise ValueError(f"Insufficient data for {symbol}")
 
-        def _calc_chop_index(df: pd.DataFrame, period: int = 14) -> float:
+        def _calc_chop_index(df, period: int = 14) -> float:
             """Chop Index: < 38.2 trending, > 61.8 choppy. Dùng pandas_ta.chop."""
             chop_series = ta.chop(df["high"], df["low"], df["close"], length=period, atr_length=1)
-            if chop_series is None or chop_series.empty or pd.isna(chop_series.iloc[-1]):
+            if chop_series is None or chop_series.empty or _pd.isna(chop_series.iloc[-1]):
                 return 50.0
             return float(chop_series.iloc[-1])
 
-        def _safe_rsi(df: pd.DataFrame, length: int = 14, default: float = 50.0) -> float:
+        def _safe_rsi(df, length: int = 14, default: float = 50.0) -> float:
             s = ta.rsi(df["close"], length=length)
-            if s is None or s.empty or pd.isna(s.iloc[-1]):
+            if s is None or s.empty or _pd.isna(s.iloc[-1]):
                 return default
             return float(s.iloc[-1])
 
@@ -446,12 +495,26 @@ class BinanceDataFetcher:
         swing_low = float(recent_atr["low"].min()) if len(recent_atr) > 0 else 0.0
         swing_high = float(recent_atr["high"].max()) if len(recent_atr) > 0 else 0.0
 
-        # VWAP intraday (HLC/3 chuẩn hơn close)
+        # VWAP session-anchored: tính từ midnight UTC hôm nay (không phải rolling N candles)
         vwap_val = 0.0
         vwap_distance_pct = 0.0
         if len(df_atr) > 0 and df_atr["volume"].sum() > 0:
-            typical = (df_atr["high"] + df_atr["low"] + df_atr["close"]) / 3
-            vwap_val = float((typical * df_atr["volume"]).sum() / df_atr["volume"].sum())
+            try:
+                import pandas as pd
+                today_utc = _pd.Timestamp.now(tz="UTC").normalize()  # Midnight UTC
+                if hasattr(df_atr.index, "tz") and df_atr.index.tz is not None:
+                    df_today = df_atr[df_atr.index >= today_utc]
+                else:
+                    df_today = df_atr[df_atr.index >= today_utc.tz_localize(None)]
+                # Fallback nếu không đủ candles hôm nay
+                if len(df_today) < 10:
+                    df_today = df_atr
+            except Exception:
+                df_today = df_atr
+            typical = (df_today["high"] + df_today["low"] + df_today["close"]) / 3
+            vol_sum = df_today["volume"].sum()
+            if vol_sum > 0:
+                vwap_val = float((typical * df_today["volume"]).sum() / vol_sum)
             current_price_val = float(df_atr["close"].iloc[-1])
             if vwap_val > 0:
                 vwap_distance_pct = (current_price_val - vwap_val) / vwap_val * 100
@@ -501,7 +564,7 @@ class BinanceDataFetcher:
         if ema_short is not None and ema_long is not None:
             e_short = float(ema_short.iloc[-1])
             e_long = float(ema_long.iloc[-1])
-            if pd.isna(e_short) or pd.isna(e_long) or e_long <= 0:
+            if _pd.isna(e_short) or _pd.isna(e_long) or e_long <= 0:
                 trend_1d = "sideways"
             elif e_short > e_long * 1.01:
                 trend_1d = "uptrend"
@@ -922,7 +985,7 @@ class WhaleDataFetcher:
     FUTURES_BASE = "https://fapi.binance.com/fapi/v1"
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+        self._client = _create_client()
         self.base = self.FUTURES_BASE
 
     async def get_whale_transactions(
