@@ -60,7 +60,7 @@ class BinanceDataFetcher:
 
     def __init__(self):
         # Data luôn dùng mainnet (testnet giá giả, derivatives đã mainnet → inconsistent)
-        self.base = self.BASE_URL
+        self.base = self.FUTURES_BASE
         self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
         # Futures data luôn dùng mainnet (testnet futures ít liquidity)
         self._futures_base = self.FUTURES_BASE
@@ -202,7 +202,7 @@ class BinanceDataFetcher:
         }
 
     async def get_all_tickers_24hr(self) -> list[dict]:
-        """Lấy tất cả ticker 24h (spot). Không truyền symbol = all pairs."""
+        """Lấy tất cả ticker 24h (futures). Không truyền symbol = all pairs."""
         try:
             resp = await _http_get_with_retry(
                 self._client,
@@ -919,8 +919,11 @@ class WhaleDataFetcher:
     3. Mempool.space         - BTC on-chain (BTC pairs only)
     """
 
+    FUTURES_BASE = "https://fapi.binance.com/fapi/v1"
+
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+        self.base = self.FUTURES_BASE
 
     async def get_whale_transactions(
         self,
@@ -963,12 +966,12 @@ class WhaleDataFetcher:
             price_resp, trades_resp = await asyncio.gather(
                 _http_get_with_retry(
                     self._client,
-                    "https://api.binance.com/api/v3/ticker/price",
+                    f"{self.base}/ticker/price",
                     params={"symbol": symbol},
                 ),
                 _http_get_with_retry(
                     self._client,
-                    "https://api.binance.com/api/v3/aggTrades",
+                    f"{self.base}/aggTrades",
                     params={"symbol": symbol, "limit": 1000},
                 ),
             )
@@ -1010,12 +1013,12 @@ class WhaleDataFetcher:
             resp, price_resp = await asyncio.gather(
                 _http_get_with_retry(
                     self._client,
-                    "https://api.binance.com/api/v3/depth",
+                    f"{self.base}/depth",
                     params={"symbol": symbol, "limit": 100},
                 ),
                 _http_get_with_retry(
                     self._client,
-                    "https://api.binance.com/api/v3/ticker/price",
+                    f"{self.base}/ticker/price",
                     params={"symbol": symbol},
                 ),
             )
@@ -1079,7 +1082,7 @@ class WhaleDataFetcher:
             btc_price = 95000.0  # fallback
             try:
                 pr = await self._client.get(
-                    "https://api.binance.com/api/v3/ticker/price",
+                    f"{self.base}/ticker/price",
                     params={"symbol": "BTCUSDT"},
                 )
                 if pr.status_code == 200:

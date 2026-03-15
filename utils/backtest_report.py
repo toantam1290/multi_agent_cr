@@ -34,7 +34,7 @@ def fetch_btc_prices(days: int) -> tuple[float, float]:
             # Get daily klines - need start and end timestamps
             end_ts = int(datetime(end_date.year, end_date.month, end_date.day).timestamp() * 1000)
             start_ts = int(datetime(start_date.year, start_date.month, start_date.day).timestamp() * 1000)
-            url = "https://api.binance.com/api/v3/klines"
+            url = "https://fapi.binance.com/fapi/v1/klines"
             params = {
                 "symbol": "BTCUSDT",
                 "interval": "1d",

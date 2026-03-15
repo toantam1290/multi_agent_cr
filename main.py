@@ -331,7 +331,7 @@ class TradingOrchestrator:
                                 new_sl = entry * 1.001 if direction == Direction.LONG else entry * 0.999
                                 if (direction == Direction.LONG and new_sl > current_sl) or (direction == Direction.SHORT and new_sl < current_sl):
                                     # Partial close: chốt 50% position tại current_price
-                                    FEE_PCT = 0.001
+                                    FEE_PCT = 0.0004  # futures taker
                                     half_size = t["position_size_usdt"] * 0.5
                                     half_qty  = t["quantity"] * 0.5
                                     if direction == Direction.LONG:
@@ -382,7 +382,7 @@ class TradingOrchestrator:
                                     pnl = (exit_price - t["entry_price"]) * quantity
                                 else:
                                     pnl = (t["entry_price"] - exit_price) * quantity
-                                FEE_PCT = 0.001
+                                FEE_PCT = 0.0004  # futures taker
                                 fee_cost = t["position_size_usdt"] * FEE_PCT * 2
                                 pnl = pnl - fee_cost
                                 pnl_pct = pnl / t["position_size_usdt"] * 100
@@ -427,8 +427,8 @@ class TradingOrchestrator:
                         else:
                             pnl = (t["entry_price"] - exit_price) * quantity
 
-                        # Trừ fee (0.1% mỗi chiều = 0.2% round trip)
-                        FEE_PCT = 0.001
+                        # Trừ fee (0.04% mỗi chiều = 0.08% round trip, futures taker)
+                        FEE_PCT = 0.0004
                         fee_cost = t["position_size_usdt"] * FEE_PCT * 2
                         pnl = pnl - fee_cost
 

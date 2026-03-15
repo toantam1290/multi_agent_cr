@@ -47,7 +47,7 @@ import pandas_ta as ta
 
 # ─── Constants (mirror production config) ────────────────────────────────────
 
-FEE_PCT = 0.001          # 0.1% mỗi chiều
+FEE_PCT = 0.0004         # 0.04% taker (futures USDT-M)
 SLIPPAGE_PCT = 0.0005    # 0.05% slippage khi fill (base, adjusted per exit type)
 SLIPPAGE_SL_PCT = 0.0015 # 0.15% SL exit slippage (market order hitting bid)
 SLIPPAGE_TP_PCT = 0.0005 # 0.05% TP exit slippage (limit order)
@@ -165,7 +165,7 @@ class BacktestResult:
 
 # ─── Binance data fetcher (sync version for backtest) ────────────────────────
 
-BINANCE_BASE = "https://api.binance.com/api/v3"
+BINANCE_BASE = "https://fapi.binance.com/fapi/v1"
 FUTURES_BASE = "https://fapi.binance.com/fapi/v1"
 
 async def fetch_klines(

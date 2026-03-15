@@ -74,7 +74,7 @@ class ExecutorAgent:
 
         SLIPPAGE_PCT = 0.0015  # 0.15% mỗi chiều (market)
         LIMIT_SLIPPAGE_PCT = 0.0005  # 0.05% (limit fill)
-        FEE_PCT = 0.001  # 0.1% mỗi chiều → 0.2% round trip
+        FEE_PCT = 0.0004  # 0.04% taker (futures USDT-M)
 
         # Scalp pullback entry: fill tại signal.entry_price (limit order simulated)
         # OB-zone-aware: nếu có ob_zone thì dùng zone boundary thay vì 0.2% threshold
@@ -241,7 +241,7 @@ class ExecutorAgent:
             try:
                 current_price = await fetcher.get_current_price(trade.pair)
                 pnl = self._calc_pnl(trade, current_price)
-                FEE_PCT = 0.001
+                FEE_PCT = 0.0004  # futures taker
                 fee_cost = trade.position_size_usdt * FEE_PCT * 2
                 pnl = pnl - fee_cost
                 pnl_pct = pnl / trade.position_size_usdt * 100 if trade.position_size_usdt else 0

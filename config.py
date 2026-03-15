@@ -198,6 +198,10 @@ ANALYSIS_INTERVALS = ["15m", "1h", "4h", "1d"]
 # Whale threshold (USD)
 WHALE_MIN_USD = 1_000_000
 
+# Futures fee (Binance USDT-M): maker 0.02%, taker 0.04%
+MAKER_FEE_PCT = float(os.getenv("MAKER_FEE_PCT", "0.0002"))
+TAKER_FEE_PCT = float(os.getenv("TAKER_FEE_PCT", "0.0004"))
+
 # Database — dùng absolute path để Web UI + scripts luôn trỏ đúng DB
 _config_dir = Path(__file__).resolve().parent
 DB_PATH = str(_config_dir / "data" / "trading.db")
