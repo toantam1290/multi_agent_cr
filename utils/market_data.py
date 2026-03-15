@@ -112,6 +112,8 @@ class BinanceDataFetcher:
         # Futures data luôn dùng mainnet (testnet futures ít liquidity)
         self._futures_base = self.FUTURES_BASE
         self._futures_data_base = self.FUTURES_DATA_BASE
+        # Cache valid futures symbols — populated by get_premium_index_full()
+        self._futures_symbols: set[str] = set()
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
         """Lấy candlestick data (có retry khi timeout/connection)."""
@@ -275,10 +277,36 @@ class BinanceDataFetcher:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data if isinstance(data, list) else []
+            if isinstance(data, list):
+                # Populate futures_symbols cache; enrich with exchangeInfo for TRADING status
+                self._futures_symbols = {p["symbol"] for p in data if "symbol" in p}
+                await self._load_tradable_symbols()
+                return data
+            return []
         except Exception as e:
             logger.warning(f"get_premium_index_full failed: {e}")
             return []
+
+    async def _load_tradable_symbols(self) -> None:
+        """Load only TRADING status symbols from exchangeInfo — filter out SETTLING/CLOSE."""
+        try:
+            resp = await _http_get_with_retry(
+                self._client,
+                f"{self._futures_base}/exchangeInfo",
+            )
+            resp.raise_for_status()
+            info = resp.json()
+            trading = {
+                s["symbol"] for s in info.get("symbols", [])
+                if s.get("status") == "TRADING" and s.get("symbol", "").endswith("USDT")
+            }
+            if trading:
+                removed = self._futures_symbols - trading
+                if removed:
+                    logger.info(f"Filtered {len(removed)} non-TRADING futures symbols")
+                self._futures_symbols = trading
+        except Exception as e:
+            logger.warning(f"_load_tradable_symbols failed: {e}")
 
     # ─── Binance Futures (funding, OI, basis) ───────────────────────────────
 
@@ -297,6 +325,8 @@ class BinanceDataFetcher:
 
     async def get_open_interest(self, symbol: str) -> tuple[float, float]:
         """(open_interest_contracts, mark_price). OI value = contracts * mark_price."""
+        if self._futures_symbols and symbol not in self._futures_symbols:
+            return 0.0, 0.0
         try:
             oi_resp, prem_resp = await asyncio.gather(
                 self._client.get(f"{self._futures_base}/openInterest", params={"symbol": symbol}),
@@ -327,6 +357,10 @@ class BinanceDataFetcher:
 
     async def get_derivatives_signal(self, symbol: str) -> DerivativesSignal:
         """Funding + OI + basis → DerivativesSignal. premiumIndex 1 lần (tránh gọi 2x)."""
+        # Skip delisted futures pairs — tránh 400 Bad Request thừa
+        if self._futures_symbols and symbol not in self._futures_symbols:
+            logger.debug(f"Derivatives skip ({symbol}): not in futures symbols")
+            return DerivativesSignal(funding_rate=0.0005, fetch_ok=False)
         try:
             # premiumIndex 1 call → funding + mark + index; openInterest riêng (có retry)
             prem_resp, oi_resp = await asyncio.gather(
